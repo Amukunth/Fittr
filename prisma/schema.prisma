@@ -1,0 +1,171 @@
+// Fittr mobile app — schema/migration tooling ONLY.
+//
+// This is a *separate* Prisma project from FittrLanding/waitlist-app, but it
+// points at the SAME Supabase Postgres database. It owns only the tables
+// below (all in the `public` schema). It must never generate a migration
+// that creates, alters, or drops `signups` (the waitlist app's table) or
+// anything in Supabase's own `auth` schema.
+//
+// User references (userId/createdById/winnerId) are plain `@db.Uuid`
+// columns, NOT a Prisma relation to a modeled `User`/`auth.users`. This is
+// deliberate, not an oversight: an earlier version of this schema declared
+// `schemas = ["public", "auth"]` (multiSchema) with a partial shadow model
+// of `auth.users` purely to get FK typing. Running `prisma migrate diff`
+// against the live database with that schema computed DROP TABLE/DROP
+// COLUMN for nearly all of Supabase's real auth.* tables and for `signups`
+// — because Prisma treats any schema listed in `schemas` as fully owned by
+// this project for diffing purposes, and anything not declared becomes a
+// "drop to reconcile" candidate. That diff was caught before being applied
+// (see BACKEND.md), but the fix is to never give Prisma diffing authority
+// over a schema — or table — it doesn't fully own. The real foreign keys to
+// `auth.users(id)` still exist; they're just hand-written raw SQL in the
+// migration file instead of a Prisma-modeled relation.
+//
+// This project is dev/CI tooling only. Nothing in FittrApp's React Native
+// bundle imports `@prisma/client` or the DATABASE_URL — see BACKEND.md.
+//
+// NEVER run `prisma db push` or `prisma migrate dev` against the shared
+// database — both compute and apply a live diff, which (even with `auth`
+// no longer in scope) would still try to DROP `signups`, since it's an
+// "unmanaged" table sitting in the same `public` schema this project
+// considers itself authoritative over. The only safe command against the
+// real database is `prisma migrate deploy`, which strictly replays the SQL
+// files in prisma/migrations and never diffs anything.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Prisma 7 removed `url`/`directUrl` from this block — Migrate now takes its
+// connection string solely from prisma.config.ts's `datasource.url`
+// (DIRECT_URL, see prisma/.env). Nothing here ever instantiates
+// PrismaClient at runtime, so there's no other place a URL needs to live.
+datasource db {
+  provider = "postgresql"
+}
+
+enum StrengthTier {
+  beginner
+  intermediate
+  advanced
+}
+
+enum ChallengeType {
+  pushups
+  plank
+  wallsit
+  race
+}
+
+enum ChallengeFormat {
+  pooled
+  one_v_one @map("1v1")
+}
+
+enum ChallengeStatus {
+  open
+  matched
+  in_progress
+  completed
+}
+
+enum LedgerReason {
+  stake
+  payout
+  bonus
+}
+
+/// Self-reported strength tier + points balance, one row per Supabase auth
+/// user. Created lazily on first login by the app (see
+/// src/hooks/useFitnessProfile.ts). userId references auth.users(id) via a
+/// raw FK in the migration SQL, not a Prisma relation — see the note above.
+model FitnessProfile {
+  id            String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String       @unique @map("user_id") @db.Uuid
+  strengthTier  StrengthTier @default(beginner) @map("strength_tier")
+  pointsBalance Int          @default(0) @map("points_balance")
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  @@map("fitness_profiles")
+}
+
+model Challenge {
+  id          String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type        ChallengeType
+  format      ChallengeFormat
+  stakePoints Int             @map("stake_points")
+  status      ChallengeStatus @default(open)
+  createdById String          @map("created_by") @db.Uuid
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  match Match?
+
+  @@index([status])
+  @@index([type])
+  @@map("challenges")
+}
+
+/// One Match per Challenge. Created by the join_challenge() DB function once
+/// a second, tier-matching participant accepts — see BACKEND.md for why
+/// matchmaking runs as a single SQL function instead of client-side writes.
+model Match {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  challengeId String    @unique @map("challenge_id") @db.Uuid
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  winnerId    String?   @map("winner_id") @db.Uuid
+  settledAt   DateTime? @map("settled_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  participants  MatchParticipant[]
+  ledgerEntries PointsLedgerEntry[]
+
+  @@map("matches")
+}
+
+model MatchParticipant {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  matchId String @map("match_id") @db.Uuid
+  match   Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  userId  String @map("user_id") @db.Uuid
+
+  /// Verified result — exactly one of these three is populated, depending
+  /// on the challenge type (reps for pushups, seconds held for plank/
+  /// wallsit, elapsed seconds for race). Not enforced at the DB level in v1.
+  repCount        Int? @map("rep_count")
+  holdDurationSec Int? @map("hold_duration_seconds")
+  timeSeconds     Int? @map("time_seconds")
+
+  verificationSession VerificationSession?
+
+  @@unique([matchId, userId])
+  @@map("match_participants")
+}
+
+/// One per participant per match (1:1 with MatchParticipant). Raw camera/
+/// pose-estimation output lands in rawMetrics once verification is built;
+/// this pass only creates the table.
+model VerificationSession {
+  id                 String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  matchParticipantId String           @unique @map("match_participant_id") @db.Uuid
+  matchParticipant   MatchParticipant @relation(fields: [matchParticipantId], references: [id], onDelete: Cascade)
+  rawMetrics         Json             @map("raw_metrics")
+  anomalyFlag        Boolean          @default(false) @map("anomaly_flag")
+  reviewed           Boolean          @default(false)
+  createdAt          DateTime         @default(now()) @map("created_at")
+
+  @@map("verification_sessions")
+}
+
+model PointsLedgerEntry {
+  id        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String       @map("user_id") @db.Uuid
+  amount    Int
+  reason    LedgerReason
+  matchId   String?      @map("match_id") @db.Uuid
+  match     Match?       @relation(fields: [matchId], references: [id])
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([matchId])
+  @@map("points_ledger_entries")
+}

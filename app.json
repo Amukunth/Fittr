@@ -1,4 +1,9 @@
 {
   "name": "FittrApp",
-  "displayName": "FittrApp"
+  "displayName": "FittrApp",
+  "extra": {
+    "eas": {
+      "projectId": "55b4d7cd-0ab1-4792-a561-a350056dadb7"
+    }
+  }
 }

@@ -66,6 +66,16 @@ yarn-error.log
 # testing
 /coverage
 
+# Environment variables. Two separate files, two separate trust levels:
+# .env            -> bundled into the app by react-native-dotenv (Supabase
+#                    URL + anon key only — anon key is meant to be public,
+#                    protected by RLS, but the file still isn't committed).
+# prisma/.env      -> Prisma CLI only, dev/CI machines. Holds DATABASE_URL /
+#                    DIRECT_URL, real Postgres credentials. Never imported by
+#                    app code, never bundled.
+.env
+prisma/.env
+
 # Yarn
 .yarn/*
 !.yarn/patches
