@@ -77,9 +77,13 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
+    // `namespace` stays com.fittrapp: it must match the Kotlin source
+    // package under src/main/java/com/fittrapp. Only applicationId (the
+    // installed/store identity) needs to match the iOS bundle id, which the
+    // QuickPose SDK key is bound to.
     namespace "com.fittrapp"
     defaultConfig {
-        applicationId "com.fittrapp"
+        applicationId "com.fittr.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
