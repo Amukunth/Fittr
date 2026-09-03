@@ -1,0 +1,21 @@
+diff --git a/node_modules/@quickpose/react-native/ios/QuickPoseView.swift b/node_modules/@quickpose/react-native/ios/QuickPoseView.swift
+index edfd44e..81ecf23 100644
+--- a/node_modules/@quickpose/react-native/ios/QuickPoseView.swift
++++ b/node_modules/@quickpose/react-native/ios/QuickPoseView.swift
+@@ -298,7 +298,15 @@ class QuickPoseView: UIView {
+     case "sideLunges": return .sideLunges(side: side ?? .left)
+     case "bicepCurls": return .bicepCurls
+     case "bicepCurlsSingleArm": return .bicepCurlsSingleArm(side: side ?? .left)
+-    case "skipping": return .skipping
++    // PATCHED (patch-package): QuickPose.FitnessFeature has no `skipping`
++    // case on iOS — verified against QuickPoseCore.xcframework's
++    // arm64-apple-ios.swiftinterface for both published pod versions (1.6.0,
++    // 1.7.0). The Android SDK does have FitnessFeature.Skipping, which is
++    // why only the iOS bridge fails to compile. Upstream bug in
++    // @quickpose/react-native 0.7.x (latest 0.7.1). Returning nil makes
++    // "fitness.skipping" a no-op feature on iOS instead of a build failure.
++    // Restore `return .skipping` if the iOS SDK ever adds the case.
++    case "skipping": return nil
+     case "burpees": return .burpees
+     case "shoulderTaps": return .shoulderTaps
+     case "highKneeTaps": return .highKneeTaps
