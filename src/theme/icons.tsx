@@ -199,27 +199,26 @@ export function Icon({
       break;
     }
     case 'bolt': {
+      // Two slanted bars, the lower one stepped to the right: a Z-shaped flash.
       const upper: ViewStyle = {
         position: 'absolute',
-        left: s * 0.28,
-        top: s * 0.02,
-        width: 0,
-        height: 0,
-        borderTopWidth: s * 0.55,
-        borderLeftWidth: s * 0.5,
-        borderTopColor: color,
-        borderLeftColor: 'transparent',
+        left: s * 0.42,
+        top: 0,
+        width: s * 0.28,
+        height: s * 0.54,
+        borderRadius: 1,
+        backgroundColor: color,
+        transform: [{ skewX: '-26deg' }],
       };
       const lower: ViewStyle = {
         position: 'absolute',
-        left: s * 0.22,
-        top: s * 0.43,
-        width: 0,
-        height: 0,
-        borderBottomWidth: s * 0.55,
-        borderRightWidth: s * 0.5,
-        borderBottomColor: color,
-        borderRightColor: 'transparent',
+        left: s * 0.3,
+        top: s * 0.46,
+        width: s * 0.28,
+        height: s * 0.54,
+        borderRadius: 1,
+        backgroundColor: color,
+        transform: [{ skewX: '-26deg' }],
       };
       body = (
         <>

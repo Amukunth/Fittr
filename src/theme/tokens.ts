@@ -1,4 +1,4 @@
-import { StyleSheet, type TextStyle } from 'react-native';
+import { Platform, StyleSheet, type TextStyle } from 'react-native';
 
 /**
  * Fittr mobile tokens, transcribed from the Claude Design canvas
@@ -121,6 +121,19 @@ export const sizes = {
   input: 56,
 } as const;
 
+/**
+ * Anton's glyph box is 1.51em tall (ascender 1.176em, descender 0.329em,
+ * cap height 0.86em). The design sets its headlines at 0.94em leading,
+ * which Android honours once includeFontPadding is off. iOS does not: when
+ * lineHeight is below the font's natural height, React Native skips its
+ * baseline centring (see RCTApplyBaselineOffsetForRange, gated behind the
+ * enableIOSCompressedTextFrameAdjustment flag, off by default) and TextKit
+ * anchors the baseline to the bottom of the line box, so ~0.19em of every
+ * capital and digit is cut off the top. 1.2em is the smallest leading that
+ * keeps caps and digits inside the box on iOS.
+ */
+const ANTON_LEADING = Platform.OS === 'ios' ? 1.2 : 1;
+
 /** Anton at a size. Tracking is in em, the design's -.01em default. */
 export function anton(
   size: number,
@@ -130,7 +143,7 @@ export function anton(
   return {
     fontFamily: fonts.display,
     fontSize: size,
-    lineHeight: size,
+    lineHeight: Math.round(size * ANTON_LEADING),
     letterSpacing: Math.round(size * tracking * 100) / 100,
     color,
     textTransform: uppercase ? 'uppercase' : 'none',

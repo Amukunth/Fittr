@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { ScrollView, Share, StyleSheet, Text, View } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
-import { supabase } from '../lib/supabase';
+import { channelName, supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { useFitnessProfile } from '../hooks/useFitnessProfile';
 import { useBoutHistory } from '../hooks/useBoutHistory';
@@ -122,7 +122,7 @@ export function ChallengeDetailScreen({ route, navigation }: Props) {
   // challenge until the next focus event.
   useEffect(() => {
     const channel = supabase
-      .channel(`challenge-detail:${challengeId}`)
+      .channel(channelName(`challenge-detail:${challengeId}`))
       .on(
         'postgres_changes',
         {

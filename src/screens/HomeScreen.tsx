@@ -11,7 +11,7 @@ import {
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { supabase } from '../lib/supabase';
+import { channelName, supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { useFitnessProfile } from '../hooks/useFitnessProfile';
 import { compactPoints, fmtPoints } from '../lib/format';
@@ -104,7 +104,7 @@ export function HomeScreen({ navigation }: Props) {
   // so every challenge row is relevant here.
   useEffect(() => {
     const channel = supabase
-      .channel('home-open-challenges')
+      .channel(channelName('home-open-challenges'))
       .on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'challenges' },

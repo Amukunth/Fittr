@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   Image,
   KeyboardAvoidingView,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -83,7 +82,10 @@ export function LoginScreen() {
   return (
     <KeyboardAvoidingView
       style={styles.screen}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      // 'padding' on both platforms: with edge-to-edge on Android the window
+      // no longer resizes for the keyboard, so without this the form sits
+      // under it.
+      behavior="padding"
     >
       <ScrollView
         contentContainerStyle={[styles.content, pad]}

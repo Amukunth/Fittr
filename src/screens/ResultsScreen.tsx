@@ -16,7 +16,7 @@ import {
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { supabase } from '../lib/supabase';
+import { channelName, supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { formatScore, scoreFor } from '../lib/boutStats';
 import { fmtPoints, formatSeconds } from '../lib/format';
@@ -138,7 +138,7 @@ export function ResultsScreen({ route, navigation }: Props) {
       return;
     }
     const channel = supabase
-      .channel(`results:${challengeId}`)
+      .channel(channelName(`results:${challengeId}`))
       .on(
         'postgres_changes',
         {

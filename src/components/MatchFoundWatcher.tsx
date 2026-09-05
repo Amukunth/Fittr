@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { supabase } from '../lib/supabase';
+import { channelName, supabase } from '../lib/supabase';
 import { navigationRef } from '../lib/navigationRef';
 import { useAuth } from '../context/AuthContext';
 import type { ChallengeRow } from '../types/database';
@@ -110,7 +110,7 @@ export function MatchFoundWatcher() {
     };
 
     const channel = supabase
-      .channel(`match-watch:${userId}`)
+      .channel(channelName(`match-watch:${userId}`))
       .on(
         'postgres_changes',
         {

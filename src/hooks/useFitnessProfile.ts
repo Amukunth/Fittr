@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { supabase } from '../lib/supabase';
+import { channelName, supabase } from '../lib/supabase';
 import type { FitnessProfileRow } from '../types/database';
 import { useAuth } from '../context/AuthContext';
 
@@ -114,7 +114,7 @@ export function useFitnessProfile(): UseFitnessProfileResult {
       return;
     }
     const channel = supabase
-      .channel(`fitness-profile:${userId}:${Math.random().toString(36).slice(2)}`)
+      .channel(channelName(`fitness-profile:${userId}`))
       .on(
         'postgres_changes',
         {
