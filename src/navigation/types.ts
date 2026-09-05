@@ -1,5 +1,6 @@
 export type RootStackParamList = {
   Login: undefined;
+  Onboarding: undefined;
   Home: undefined;
   CreateChallenge: undefined;
   ChallengeDetail: { challengeId: string };

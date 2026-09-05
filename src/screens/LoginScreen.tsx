@@ -1,129 +1,200 @@
 import React, { useState } from 'react';
 import {
+  Image,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
+  ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
+  View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../context/AuthContext';
-import { colors, space, typography } from '../theme/tokens';
-import {
-  Body,
-  ErrorText,
-  Headline,
-  Input,
-  Kicker,
-  Label,
-  Muted,
-  PrimaryButton,
-  Wordmark,
-} from '../theme/ui';
+import { colors, fonts, space, typography } from '../theme/tokens';
+import { Body, Button, Display, Input, Notice, Small } from '../theme/ui';
 
+const logo = require('../../assets/images/fittr-logo.png');
+
+/**
+ * Email-first auth, one screen for both modes. Sign-up adds a handle field
+ * (stored on the auth user, see AuthContext). Passwords stay: the backend
+ * is Supabase email/password, so "continue with email" here means log in.
+ */
 export function LoginScreen() {
   const { signInWithPassword, signUpWithPassword } = useAuth();
-  const [mode, setMode] = useState<'sign-in' | 'sign-up'>('sign-in');
+  const insets = useSafeAreaInsets();
+  const [mode, setMode] = useState<'login' | 'signup'>('login');
+  const [handle, setHandle] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
+  const signup = mode === 'signup';
+
   const submit = async () => {
     setError(null);
     setInfo(null);
+    if (signup && !handle.trim()) {
+      setError('Pick a handle. It goes on the card.');
+      return;
+    }
     if (!email.trim() || !password) {
       setError('Enter an email and password.');
       return;
     }
 
     setSubmitting(true);
-    const result =
-      mode === 'sign-in'
-        ? await signInWithPassword(email.trim(), password)
-        : await signUpWithPassword(email.trim(), password);
-    setSubmitting(false);
-
-    if (result.error) {
-      setError(result.error);
-    } else if (mode === 'sign-up') {
-      setInfo('Account created. Confirm it from your email, then log in.');
+    if (signup) {
+      const result = await signUpWithPassword(
+        email.trim(),
+        password,
+        handle.trim(),
+      );
+      setSubmitting(false);
+      if (result.error) {
+        setError(result.error);
+      } else if (result.needsConfirmation) {
+        setInfo('Account created. Tap the link in your email, then log in.');
+        setMode('login');
+      }
+    } else {
+      const result = await signInWithPassword(email.trim(), password);
+      setSubmitting(false);
+      if (result.error) {
+        setError(result.error);
+      }
     }
   };
 
-  const signingIn = mode === 'sign-in';
+  const switchMode = () => {
+    setError(null);
+    setInfo(null);
+    setMode(signup ? 'login' : 'signup');
+  };
+
+  const pad = {
+    paddingTop: insets.top + space.xxxl + space.sm,
+    paddingBottom: Math.max(insets.bottom, space.lg) + space.xxl,
+  };
 
   return (
     <KeyboardAvoidingView
-      style={styles.container}
+      style={styles.screen}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
-      <Wordmark size={56} />
-      <Kicker style={styles.kicker}>Verified, not guessed.</Kicker>
-
-      <Headline>{signingIn ? 'Back in the ring' : 'Weigh in'}</Headline>
-      <Muted style={styles.lede}>
-        {signingIn
-          ? 'Log in. Somebody on the card is waiting on you.'
-          : 'Make your account, then call somebody out.'}
-      </Muted>
-
-      <Label style={styles.fieldLabel}>Email</Label>
-      <Input
-        placeholder="you@example.com"
-        autoCapitalize="none"
-        keyboardType="email-address"
-        value={email}
-        onChangeText={setEmail}
-      />
-      <Label style={styles.fieldLabel}>Password</Label>
-      <Input
-        placeholder="••••••••"
-        secureTextEntry
-        value={password}
-        onChangeText={setPassword}
-      />
-
-      {error ? <ErrorText style={styles.message}>{error}</ErrorText> : null}
-      {info ? <Body style={styles.message}>{info}</Body> : null}
-
-      <PrimaryButton
-        style={styles.cta}
-        label={signingIn ? 'Log in' : 'Create account'}
-        onPress={submit}
-        loading={submitting}
-      />
-
-      <TouchableOpacity
-        onPress={() => {
-          setError(null);
-          setInfo(null);
-          setMode(mode === 'sign-in' ? 'sign-up' : 'sign-in');
-        }}
+      <ScrollView
+        contentContainerStyle={[styles.content, pad]}
+        keyboardShouldPersistTaps="handled"
+        bounces={false}
       >
-        <Text style={styles.switchModeText}>
-          {signingIn ? 'First time here? Weigh in' : 'Already weighed in? Log in'}
+        <View style={styles.brand}>
+          <Image source={logo} style={styles.logo} accessibilityLabel="Fittr" />
+          <Text style={styles.wordmark}>FITTR</Text>
+        </View>
+
+        <View style={styles.spacer} />
+
+        <Display size={52}>
+          {signup
+            ? 'PUT YOUR NAME ON THE CARD.'
+            : 'SOMEBODY YOU KNOW IS ABOUT TO LOSE.'}
+        </Display>
+        <Body muted style={styles.sub}>
+          {signup
+            ? 'Handle, email, done. Your first purse is waiting.'
+            : 'Log in. Your record is waiting for you.'}
+        </Body>
+
+        <View style={styles.form}>
+          {signup ? (
+            <Input
+              placeholder="@handle"
+              autoCapitalize="none"
+              autoCorrect={false}
+              value={handle}
+              onChangeText={setHandle}
+              returnKeyType="next"
+            />
+          ) : null}
+          <Input
+            placeholder="you@email.com"
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="email-address"
+            textContentType="emailAddress"
+            value={email}
+            onChangeText={setEmail}
+            returnKeyType="next"
+          />
+          <Input
+            placeholder="Password"
+            secureTextEntry
+            textContentType={signup ? 'newPassword' : 'password'}
+            value={password}
+            onChangeText={setPassword}
+            returnKeyType="go"
+            onSubmitEditing={submit}
+          />
+          {error ? <Notice icon="warning">{error}</Notice> : null}
+          {info ? <Notice icon="seal-check" iconColor={colors.accent}>{info}</Notice> : null}
+          <Button
+            label={signup ? 'CREATE ACCOUNT' : 'LOG IN'}
+            onPress={submit}
+            loading={submitting}
+          />
+        </View>
+
+        <View style={styles.switchRow}>
+          <Small>{signup ? 'Already fighting?' : 'New here?'}</Small>
+          <Pressable onPress={switchMode} hitSlop={8} accessibilityRole="button">
+            <Text style={styles.switchLink}>{signup ? 'Log in' : 'Sign up'}</Text>
+          </Pressable>
+        </View>
+        <Text style={styles.footnote}>
+          18+ only. Points have no cash value during pilot.
         </Text>
-      </TouchableOpacity>
+      </ScrollView>
     </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: 'center',
-    paddingHorizontal: space.lg,
-    backgroundColor: colors.bg,
+  screen: { flex: 1, backgroundColor: colors.bg },
+  content: {
+    flexGrow: 1,
+    paddingHorizontal: space.xxl,
   },
-  kicker: { marginTop: space.md, marginBottom: space.xl },
-  lede: { marginTop: space.sm, marginBottom: space.lg },
-  fieldLabel: { marginTop: space.md, marginBottom: space.sm },
-  message: { marginTop: space.md },
-  cta: { marginTop: space.lg },
-  switchModeText: {
-    ...typography.bodySm,
+  brand: { flexDirection: 'row', alignItems: 'center', gap: space.md },
+  logo: { width: 40, height: 40, borderRadius: 10 },
+  wordmark: {
+    fontFamily: fonts.semibold,
+    fontSize: 13,
+    letterSpacing: 4.2,
+    color: colors.text,
+    includeFontPadding: false,
+  },
+  spacer: { flex: 1, minHeight: space.xxxl },
+  sub: { marginTop: 14 },
+  form: { marginTop: space.xxxl, gap: space.sm + 2 },
+  switchRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 22,
+  },
+  switchLink: {
+    fontFamily: fonts.medium,
+    fontSize: 13,
+    lineHeight: 19,
+    color: colors.accent,
+  },
+  footnote: {
+    ...typography.footnote,
     textAlign: 'center',
-    marginTop: space.lg,
+    marginTop: space.cardPad,
   },
 });

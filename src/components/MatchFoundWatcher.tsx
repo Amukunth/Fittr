@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { supabase } from '../lib/supabase';
 import { navigationRef } from '../lib/navigationRef';
 import { useAuth } from '../context/AuthContext';
 import type { ChallengeRow } from '../types/database';
-import { colors, radius, space, typography } from '../theme/tokens';
+import { Icon } from '../theme/icons';
+import { anton, colors, fonts, radius, space } from '../theme/tokens';
 import { EXERCISE_LABEL } from '../theme/copy';
 
 /**
@@ -40,6 +42,7 @@ interface PendingMatch {
 
 export function MatchFoundWatcher() {
   const { session } = useAuth();
+  const insets = useSafeAreaInsets();
   const userId = session?.user.id ?? null;
   const [pending, setPending] = useState<PendingMatch | null>(null);
 
@@ -146,30 +149,35 @@ export function MatchFoundWatcher() {
     return null;
   }
 
+  const offset = { paddingTop: insets.top + space.sm };
+
   return (
-    <View style={styles.banner} pointerEvents="box-none">
+    <View style={[styles.banner, offset]} pointerEvents="box-none">
       {/* An accent-filled plate: the ink fills the whole region, not an edge. */}
       <View style={styles.bannerInner}>
         <View style={styles.bannerText}>
-          <Text style={styles.bannerTitle}>It's on</Text>
+          <Text style={styles.bannerTitle}>It's on.</Text>
           <Text style={styles.bannerBody}>
             Somebody took your{' '}
             {EXERCISE_LABEL[pending.challengeType].toLowerCase()} bout.
           </Text>
         </View>
-        <TouchableOpacity
-          style={styles.bannerButton}
+        <Pressable
+          style={({ pressed }) => [styles.bannerButton, pressed && styles.pressed]}
           onPress={() => goToMatch(pending.matchId)}
+          accessibilityRole="button"
         >
           <Text style={styles.bannerButtonText}>Enter</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
+        </Pressable>
+        <Pressable
           style={styles.bannerDismiss}
           onPress={() => setPending(null)}
+          accessibilityRole="button"
           accessibilityLabel="Dismiss"
+          hitSlop={8}
         >
-          <Text style={styles.bannerDismissText}>✕</Text>
-        </TouchableOpacity>
+          <Icon name="x" size={14} color={colors.onAccentMuted} />
+        </Pressable>
       </View>
     </View>
   );
@@ -181,40 +189,39 @@ const styles = StyleSheet.create({
     top: 0,
     left: 0,
     right: 0,
-    paddingTop: 48,
-    paddingHorizontal: space.sm + 4,
+    paddingHorizontal: space.md,
   },
   bannerInner: {
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: colors.accent,
-    borderRadius: radius.lg,
-    paddingVertical: space.sm + 4,
-    paddingHorizontal: space.md,
+    borderRadius: radius.card,
+    paddingVertical: space.md,
+    paddingHorizontal: space.lg,
   },
   bannerText: { flex: 1 },
-  bannerTitle: { ...typography.subhead, color: colors.onAccent },
+  bannerTitle: { ...anton(22, { color: colors.onAccent }) },
   bannerBody: {
-    ...typography.bodySm,
+    fontFamily: fonts.medium,
+    fontSize: 13,
+    lineHeight: 18,
     color: colors.onAccentMuted,
     marginTop: 2,
   },
   bannerButton: {
     backgroundColor: colors.onAccent,
-    borderRadius: radius.sm,
-    paddingVertical: space.sm + 2,
-    paddingHorizontal: space.md,
-    marginLeft: space.sm + 4,
+    borderRadius: radius.tile,
+    height: 40,
+    paddingHorizontal: space.lg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: space.md,
   },
-  bannerButtonText: { ...typography.button, color: colors.accent },
+  pressed: { opacity: 0.8 },
+  bannerButtonText: { ...anton(16, { tracking: 0.04, color: colors.accent }) },
   bannerDismiss: {
-    paddingLeft: space.sm + 4,
+    paddingLeft: space.md,
     paddingRight: space.xs,
     paddingVertical: space.sm,
-  },
-  bannerDismissText: {
-    color: colors.onAccentMuted,
-    fontSize: 16,
-    fontWeight: '700',
   },
 });

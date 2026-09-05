@@ -1,29 +1,48 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { ScrollView, Share, StyleSheet, Text, View } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
+import { useFitnessProfile } from '../hooks/useFitnessProfile';
+import { useBoutHistory } from '../hooks/useBoutHistory';
+import { formatScore } from '../lib/boutStats';
+import { fmtPoints } from '../lib/format';
+import { initialsOf, ownHandle, peerHandle } from '../lib/identity';
 import type { RootStackParamList } from '../navigation/types';
 import type {
   ChallengeRow,
   MatchParticipantRow,
   MatchRow,
 } from '../types/database';
-import { space, typography } from '../theme/tokens';
-import { EXERCISE_LABEL, FORMAT_LABEL, STATUS_LABEL } from '../theme/copy';
 import {
-  Center,
-  ErrorText,
-  Kicker,
+  EXERCISE_LABEL,
+  EXERCISE_RULES,
+  EXERCISE_SCORE,
+  FORMAT_LABEL,
+  SEATS,
+  STATUS_LABEL,
+  TIER_COLOR,
+  TIER_LABEL,
+  UNIT,
+} from '../theme/copy';
+import { colors, fonts, label, space } from '../theme/tokens';
+import {
+  Avatar,
+  Body,
+  Button,
+  Card,
+  Display,
+  Dock,
+  IconCircle,
+  Label,
   Loading,
-  Muted,
-  Plate,
-  PrimaryButton,
-  Screen,
-  Stat,
-  Subhead,
-  TapeRow,
+  Notice,
+  Numeral,
+  Slots,
+  StatCard,
+  Tag,
+  TopBar,
 } from '../theme/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'ChallengeDetail'>;
@@ -31,6 +50,8 @@ type Props = NativeStackScreenProps<RootStackParamList, 'ChallengeDetail'>;
 export function ChallengeDetailScreen({ route, navigation }: Props) {
   const { challengeId } = route.params;
   const { session } = useAuth();
+  const { profile } = useFitnessProfile();
+  const { stats } = useBoutHistory();
 
   const [challenge, setChallenge] = useState<ChallengeRow | null>(null);
   const [match, setMatch] = useState<MatchRow | null>(null);
@@ -161,108 +182,344 @@ export function ChallengeDetailScreen({ route, navigation }: Props) {
     await load();
   };
 
+  const back = () => {
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+    } else {
+      navigation.navigate('Home');
+    }
+  };
+
+  const share = () => {
+    if (!challenge) {
+      return;
+    }
+    Share.share({
+      message: `Take my ${EXERCISE_LABEL[challenge.type].toLowerCase()} bout on Fittr. ${fmtPoints(challenge.stake_points)} ${UNIT} on the line.`,
+    }).catch(() => undefined);
+  };
+
   if (loading) {
     return <Loading />;
   }
 
   if (!challenge) {
     return (
-      <Center>
-        <ErrorText>{error ?? "That bout isn't on the card."}</ErrorText>
-      </Center>
+      <View style={styles.screen}>
+        <TopBar
+          left={<IconCircle icon="arrow-left" accessibilityLabel="Back" onPress={back} />}
+        />
+        <View style={styles.missing}>
+          <Display size={44}>NOT ON{'\n'}THE CARD.</Display>
+          <Body muted style={styles.missingBody}>
+            {error ?? "That bout isn't on the card any more."}
+          </Body>
+        </View>
+      </View>
     );
   }
 
-  const isOwnChallenge = challenge.created_by === session?.user.id;
-  const canJoin = challenge.status === 'open' && !isOwnChallenge;
+  const me = session?.user.id ?? null;
+  const isOwn = challenge.created_by === me;
+  const otherId =
+    participants.find(p => p.user_id !== me)?.user_id ??
+    (isOwn ? null : challenge.created_by);
+  const otherHandle = otherId ? peerHandle(otherId) : null;
+  const myHandle = ownHandle(session);
+  const myTier = profile?.strength_tier ?? null;
+
+  const open = challenge.status === 'open';
+  const live = challenge.status === 'matched' || challenge.status === 'in_progress';
   const decided =
     challenge.status === 'completed' || challenge.status === 'needs_review';
+  const filled = open ? 1 : SEATS;
+  const stake = challenge.stake_points;
+  const balance = profile?.points_balance ?? null;
+  const short = balance === null ? 0 : Math.max(0, stake - balance);
+  const canJoin = open && !isOwn;
+  // The other corner's tier is only knowable once the seat is taken:
+  // join_challenge() refuses a mismatch, so a matched opponent is in my class.
+  const otherTier = !open && myTier ? myTier : null;
+  const record = stats ? `${stats.wins}–${stats.losses}` : '—';
+  const best = stats
+    ? formatScore(stats.bestByType[challenge.type] ?? null, challenge.type)
+    : '—';
 
   return (
-    <Screen>
-      <Kicker>
-        {STATUS_LABEL[challenge.status]}
-        {isOwnChallenge ? ' · Your call-out' : ''}
-      </Kicker>
-      <Text style={typography.display}>{EXERCISE_LABEL[challenge.type]}</Text>
-
-      <View style={styles.tape}>
-        <Plate raised style={styles.tapePlate}>
-          <Stat label="Stake" value={`${challenge.stake_points} pts`} accent />
-        </Plate>
-        <Plate raised style={styles.tapePlate}>
-          <Stat label="Format" value={FORMAT_LABEL[challenge.format]} />
-        </Plate>
-      </View>
-
-      {challenge.status === 'open' && isOwnChallenge ? (
-        <Muted style={styles.note}>
-          Posted. Waiting on somebody to take it.
-        </Muted>
-      ) : null}
-
-      {error ? <ErrorText style={styles.error}>{error}</ErrorText> : null}
-
-      {match && (
-        <View style={styles.section}>
-          <Subhead style={styles.sectionTitle}>Tale of the tape</Subhead>
-          <Plate>
-            {participants.map((p, i) => (
-              <TapeRow
-                key={p.id}
-                left={
-                  p.user_id === session?.user.id ? 'You' : p.user_id.slice(0, 8)
-                }
-                last={i === participants.length - 1}
-              />
-            ))}
-          </Plate>
+    <View style={styles.screen}>
+      <TopBar
+        left={<IconCircle icon="arrow-left" accessibilityLabel="Back" onPress={back} />}
+        right={
+          <IconCircle
+            icon="share"
+            color={colors.secondary}
+            accessibilityLabel="Share this bout"
+            onPress={share}
+          />
+        }
+      />
+      <ScrollView
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+      >
+        <View>
+          <View style={styles.statusRow}>
+            <Tag label={FORMAT_LABEL[challenge.format]} />
+            <Label size={11} tracking={0.12}>
+              {isOwn
+                ? `${STATUS_LABEL[challenge.status]} · YOUR CALL-OUT`
+                : STATUS_LABEL[challenge.status]}
+            </Label>
+          </View>
+          <Display size={56} style={styles.title}>
+            {EXERCISE_LABEL[challenge.type]}
+          </Display>
         </View>
-      )}
 
-      {canJoin && (
-        <PrimaryButton
-          style={styles.cta}
-          label={`Accept the bout · ${challenge.stake_points} pts`}
-          onPress={join}
-          loading={joining}
-        />
-      )}
+        <View style={styles.grid}>
+          <StatCard label="STAKE" value={fmtPoints(stake)} unit={UNIT} style={styles.half} />
+          <StatCard
+            label="WINNER TAKES"
+            value={fmtPoints(stake * SEATS)}
+            unit={UNIT}
+            accent
+            style={styles.half}
+          />
+        </View>
 
-      {match && challenge.status === 'matched' && (
-        <PrimaryButton
-          style={styles.cta}
-          label="Enter the ring"
-          onPress={() =>
-            navigation.navigate('MatchInProgress', { matchId: match.id })
-          }
-        />
-      )}
+        <Card>
+          <Label style={styles.centered}>TALE OF THE TAPE</Label>
+          <View style={styles.tapeHead}>
+            <View style={styles.corner}>
+              <Avatar
+                initials={otherHandle ? initialsOf(otherHandle) : '?'}
+                size={44}
+                tone={otherHandle ? 'raised' : 'empty'}
+              />
+              <Text style={styles.tapeName}>{otherHandle ?? 'open seat'}</Text>
+              <Text
+                style={[
+                  styles.tapeTier,
+                  otherTier ? { color: TIER_COLOR[otherTier] } : null,
+                ]}
+              >
+                {otherTier ? TIER_LABEL[otherTier].toUpperCase() : '—'}
+              </Text>
+            </View>
+            <Display size={22} color={colors.dim}>
+              VS
+            </Display>
+            <View style={[styles.corner, styles.cornerRight]}>
+              <Avatar initials={initialsOf(myHandle)} size={44} tone="accent" />
+              <Text style={styles.tapeName}>you</Text>
+              <Text
+                style={[styles.tapeTier, myTier ? { color: TIER_COLOR[myTier] } : null]}
+              >
+                {myTier ? TIER_LABEL[myTier].toUpperCase() : '—'}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.tapeRows}>
+            <TapeRow left="—" label="RECORD" right={record} />
+            <TapeRow
+              left="—"
+              label={`BEST ${EXERCISE_SCORE[challenge.type]}`}
+              right={best}
+            />
+            <TapeRow left="—" label="STREAK" right={stats?.streak ?? '—'} />
+          </View>
+        </Card>
 
-      {/* needs_review is a settled-enough state to have results worth
-          showing (scores are in, the payout is just held) — gating only on
-          'completed' would make a flagged match unreachable from here. */}
-      {match && decided && (
-        <PrimaryButton
-          style={styles.cta}
-          label={
-            challenge.status === 'needs_review'
-              ? 'See the decision · under review'
-              : 'See the decision'
-          }
-          onPress={() => navigation.navigate('Results', { matchId: match.id })}
-        />
-      )}
-    </Screen>
+        <Card>
+          <View style={styles.spotsHead}>
+            <Label>SPOTS CLAIMED</Label>
+            <Text style={styles.spotsText}>
+              {filled} <Text style={styles.spotsOf}>of</Text> {SEATS}
+            </Text>
+          </View>
+          <Slots filled={filled} max={SEATS} height={6} gap={4} style={styles.slots} />
+        </Card>
+
+        <View style={styles.rules}>
+          <Label>RULES</Label>
+          <Text style={styles.rulesText}>
+            {EXERCISE_RULES[challenge.type]} Camera verified. Partial reps
+            don't count.
+          </Text>
+          <View style={styles.verified}>
+            <Label>VERIFIED BY</Label>
+            <Label color={colors.secondary} tracking={0.06}>
+              POSE ESTIMATION · LIVENESS CHECK
+            </Label>
+          </View>
+        </View>
+      </ScrollView>
+
+      <Dock>
+        {error ? (
+          <Notice icon="warning" style={styles.notice}>
+            {error}
+          </Notice>
+        ) : null}
+
+        {canJoin && short > 0 ? (
+          <>
+            <Notice icon="warning" style={styles.notice}>
+              {`You're ${fmtPoints(short)} ${UNIT} short. Win a smaller bout first.`}
+            </Notice>
+            <Button label={`ACCEPT · ${fmtPoints(stake)} ${UNIT}`} disabled />
+          </>
+        ) : null}
+
+        {canJoin && short === 0 ? (
+          <Button
+            label={`ACCEPT · ${fmtPoints(stake)} ${UNIT}`}
+            onPress={join}
+            loading={joining}
+          />
+        ) : null}
+
+        {open && isOwn ? (
+          <>
+            <Notice icon="clock" iconColor={colors.secondary} style={styles.notice}>
+              Posted. Waiting on somebody at your level to take it.
+            </Notice>
+            <Button
+              label="BACK TO BOUTS"
+              variant="secondary"
+              onPress={() => navigation.navigate('Home')}
+            />
+          </>
+        ) : null}
+
+        {!open && !match ? (
+          <>
+            <Notice icon="clock" iconColor={colors.secondary} style={styles.notice}>
+              This seat is taken. Find another bout.
+            </Notice>
+            <Button
+              label="FIND ANOTHER"
+              variant="secondary"
+              onPress={() => navigation.navigate('Home')}
+            />
+          </>
+        ) : null}
+
+        {match && live ? (
+          <Button
+            label="ENTER THE RING"
+            onPress={() =>
+              navigation.navigate('MatchInProgress', { matchId: match.id })
+            }
+          />
+        ) : null}
+
+        {/* needs_review is a settled-enough state to have results worth
+            showing (scores are in, the payout is just held). Gating only on
+            'completed' would make a flagged match unreachable from here. */}
+        {match && decided ? (
+          <Button
+            label={
+              challenge.status === 'needs_review'
+                ? 'SEE THE DECISION · UNDER REVIEW'
+                : 'SEE THE DECISION'
+            }
+            onPress={() => navigation.navigate('Results', { matchId: match.id })}
+          />
+        ) : null}
+      </Dock>
+    </View>
+  );
+}
+
+/** One row of the tape: their figure, the label, my figure. */
+function TapeRow({
+  left,
+  label: name,
+  right,
+}: {
+  left: string;
+  label: string;
+  right: string;
+}) {
+  return (
+    <View style={styles.tapeRow}>
+      <Numeral size={22} style={styles.tapeCell}>
+        {left}
+      </Numeral>
+      <Label tracking={0.12}>{name}</Label>
+      <Numeral size={22} style={[styles.tapeCell, styles.tapeCellRight]}>
+        {right}
+      </Numeral>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  tape: { flexDirection: 'row', gap: space.sm + 2, marginTop: space.lg },
-  tapePlate: { flex: 1 },
-  note: { marginTop: space.md },
-  error: { marginTop: space.md },
-  section: { marginTop: space.xl },
-  sectionTitle: { marginBottom: space.sm + 2 },
-  cta: { marginTop: space.xl },
+  screen: { flex: 1, backgroundColor: colors.bg },
+  content: {
+    paddingTop: 22,
+    paddingHorizontal: space.gutter,
+    paddingBottom: space.gutter,
+    gap: space.xl,
+  },
+  missing: { flex: 1, justifyContent: 'center', paddingHorizontal: space.xxl },
+  missingBody: { marginTop: space.md },
+
+  statusRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm },
+  title: { marginTop: space.md },
+  grid: { flexDirection: 'row', gap: space.sm },
+  half: { flex: 1 },
+
+  centered: { textAlign: 'center' },
+  tapeHead: {
+    marginTop: space.lg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: space.md,
+  },
+  corner: { flex: 1, alignItems: 'flex-start' },
+  cornerRight: { alignItems: 'flex-end' },
+  tapeName: {
+    fontFamily: fonts.semibold,
+    fontSize: 13,
+    color: colors.text,
+    marginTop: space.sm,
+    includeFontPadding: false,
+  },
+  tapeTier: { ...label(10, colors.dim, 0.12), marginTop: space.xs },
+  tapeRows: { marginTop: space.cardPad, gap: space.sm + 2 },
+  tapeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  tapeCell: { flex: 1 },
+  tapeCellRight: { textAlign: 'right' },
+
+  spotsHead: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  spotsText: {
+    fontFamily: fonts.medium,
+    fontSize: 13,
+    color: colors.text,
+    includeFontPadding: false,
+  },
+  spotsOf: { color: colors.dim },
+  slots: { marginTop: space.sm + 2 },
+
+  rules: { paddingHorizontal: space.xs, gap: space.sm },
+  rulesText: {
+    fontFamily: fonts.body,
+    fontSize: 14,
+    lineHeight: 21,
+    color: colors.secondary,
+  },
+  verified: { flexDirection: 'row', alignItems: 'center', gap: space.sm },
+
+  notice: { marginBottom: space.sm + 2 },
 });

@@ -1,13 +1,15 @@
-import React from 'react';
-import { ActivityIndicator, StyleSheet, View } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
+import React, { useEffect, useState } from 'react';
+import { DarkTheme, NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useAuth } from '../context/AuthContext';
 import { navigationRef } from '../lib/navigationRef';
+import { hasOnboarded } from '../lib/onboarding';
 import { MatchFoundWatcher } from '../components/MatchFoundWatcher';
-import { colors, fonts } from '../theme/tokens';
+import { colors } from '../theme/tokens';
+import { Loading } from '../theme/ui';
 import type { RootStackParamList } from './types';
 import { LoginScreen } from '../screens/LoginScreen';
+import { OnboardingScreen } from '../screens/OnboardingScreen';
 import { HomeScreen } from '../screens/HomeScreen';
 import { CreateChallengeScreen } from '../screens/CreateChallengeScreen';
 import { ChallengeDetailScreen } from '../screens/ChallengeDetailScreen';
@@ -17,70 +19,87 @@ import { ProfileScreen } from '../screens/ProfileScreen';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
+/** Keeps the container's own ground black, so screen transitions never flash white. */
+const theme = {
+  ...DarkTheme,
+  colors: {
+    ...DarkTheme.colors,
+    primary: colors.accent,
+    background: colors.bg,
+    card: colors.bg,
+    text: colors.text,
+    border: colors.tabLine,
+  },
+};
+
 export function RootNavigator() {
   const { session, loading } = useAuth();
+  const userId = session?.user.id ?? null;
 
-  if (loading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color={colors.accent} />
-      </View>
-    );
+  // null while the per-user flag is being read; the signed-in stack is not
+  // rendered until it's known, so the first screen is the right one.
+  const [onboarded, setOnboarded] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    if (!userId) {
+      setOnboarded(null);
+      return;
+    }
+    let cancelled = false;
+    hasOnboarded(userId).then(value => {
+      if (!cancelled) {
+        setOnboarded(value);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  if (loading || (userId && onboarded === null)) {
+    return <Loading />;
   }
 
+  // Every screen draws its own chrome (back circles, page heads, the tab
+  // bar) exactly where the design puts it, so the native header is off.
+  // When the signed-in set replaces Login, React Navigation lands on the
+  // FIRST screen listed, which is why Onboarding is ordered ahead of Home
+  // for a first-time user.
+  const onboarding = (
+    <Stack.Screen name="Onboarding" component={OnboardingScreen} />
+  );
+
   return (
-    <NavigationContainer ref={navigationRef}>
+    <NavigationContainer ref={navigationRef} theme={theme}>
       <Stack.Navigator
         screenOptions={{
-          headerStyle: { backgroundColor: colors.bg },
-          headerShadowVisible: false,
-          headerTintColor: colors.accent,
-          // headerTitleStyle only accepts family/size/weight/color, so the
-          // titles below are written in caps rather than transformed.
-          headerTitleStyle: styles.headerTitle,
-          headerBackButtonDisplayMode: 'minimal',
+          headerShown: false,
           contentStyle: { backgroundColor: colors.bg },
         }}
       >
         {session ? (
           <>
-            <Stack.Screen
-              name="Home"
-              component={HomeScreen}
-              options={{ title: 'FIGHT CARD' }}
-            />
+            {onboarded ? null : onboarding}
+            <Stack.Screen name="Home" component={HomeScreen} />
+            {onboarded ? onboarding : null}
             <Stack.Screen
               name="CreateChallenge"
               component={CreateChallengeScreen}
-              options={{ title: 'CALL OUT' }}
             />
             <Stack.Screen
               name="ChallengeDetail"
               component={ChallengeDetailScreen}
-              options={{ title: 'THE BOUT' }}
             />
             <Stack.Screen
               name="MatchInProgress"
               component={MatchInProgressScreen}
-              options={{ title: 'IN THE RING', headerBackVisible: false }}
+              options={{ gestureEnabled: false }}
             />
-            <Stack.Screen
-              name="Results"
-              component={ResultsScreen}
-              options={{ title: 'DECISION' }}
-            />
-            <Stack.Screen
-              name="Profile"
-              component={ProfileScreen}
-              options={{ title: 'YOUR CORNER' }}
-            />
+            <Stack.Screen name="Results" component={ResultsScreen} />
+            <Stack.Screen name="Profile" component={ProfileScreen} />
           </>
         ) : (
-          <Stack.Screen
-            name="Login"
-            component={LoginScreen}
-            options={{ headerShown: false }}
-          />
+          <Stack.Screen name="Login" component={LoginScreen} />
         )}
       </Stack.Navigator>
       {/*
@@ -92,18 +111,3 @@ export function RootNavigator() {
     </NavigationContainer>
   );
 }
-
-const styles = StyleSheet.create({
-  center: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.bg,
-  },
-  headerTitle: {
-    fontFamily: fonts.display,
-    fontWeight: '800',
-    fontSize: 22,
-    color: colors.text,
-  },
-});

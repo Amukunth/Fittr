@@ -1,12 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Alert,
+  Linking,
   Platform,
   PermissionsAndroid,
+  Pressable,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   QuickPoseView,
   QuickPoseThresholdCounter,
@@ -15,20 +19,26 @@ import {
 import { QUICKPOSE_SDK_KEY } from '@env';
 import { supabase } from '../lib/supabase';
 import { QuickPoseHoldTracker } from '../lib/holdTracker';
+import { formatScore, scoreFor } from '../lib/boutStats';
+import { formatSeconds } from '../lib/format';
+import { initialsOf, peerHandle } from '../lib/identity';
 import { useAuth } from '../context/AuthContext';
 import type { RootStackParamList } from '../navigation/types';
 import type { ChallengeType, MatchParticipantRow } from '../types/database';
-import { colors, space, typography } from '../theme/tokens';
-import { EXERCISE_LABEL } from '../theme/copy';
+import { EXERCISE_LABEL, EXERCISE_SCORE } from '../theme/copy';
+import { Icon, type IconName } from '../theme/icons';
+import { colors, label, radius, space } from '../theme/tokens';
 import {
-  Center,
-  ErrorText,
-  Headline,
-  Kicker,
+  Avatar,
+  Body,
+  Button,
+  Display,
+  Dock,
   Label,
+  LiveDot,
   Loading,
-  Muted,
-  PrimaryButton,
+  Notice,
+  Numeral,
 } from '../theme/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'MatchInProgress'>;
@@ -62,7 +72,6 @@ interface ExerciseConfig {
   readonly feature: string;
   /** reps = count enter/exit crossings; hold = accumulate time above threshold. */
   readonly mode: 'reps' | 'hold';
-  readonly unitLabel: string;
   readonly instruction: string;
 }
 
@@ -82,35 +91,23 @@ interface ExerciseConfig {
  * blocking wallsit the way race is blocked. Nothing else needs to change.
  *
  * rangeOfMotion.knee / rangeOfMotion.hip were investigated as an alternative
- * and rejected — see "Exercise types and the wall-sit proxy" in BACKEND.md
- * for the full writeup. Short version: docs.quickpose.ai/.../Range Of
- * Motion/Knee confirms (via its own `%.0f°` format-string example) that a ROM
- * result is a live angle IN DEGREES, not the 0..1 probability every other
- * signal in this file uses — so it can't plug into QuickPoseHoldTracker's
- * enter/exit hysteresis without a different (range-containment) comparison.
- * Worse: no QuickPose doc anywhere states a target angle for a wall-sit knee/
- * hip bend, so a threshold would be pure invention with zero vendor backing —
- * strictly less grounded than fitness.squats, which is at least a real
- * trained classifier. The fix candidates above remain the better next move.
+ * and rejected — see "Exercise types and the wall-sit proxy" in BACKEND.md.
  */
 const EXERCISES: Record<ScoredType, ExerciseConfig> = {
   pushups: {
     feature: 'fitness.pushUps',
     mode: 'reps',
-    unitLabel: 'reps',
-    instruction: 'Full push-ups, whole body in frame.',
+    instruction: 'Full push-ups, whole body in frame. Prop the phone 2–3 m away.',
   },
   plank: {
     feature: 'fitness.plank',
     mode: 'hold',
-    unitLabel: 'held',
-    instruction: 'Hold the plank. The timer pauses if you break form.',
+    instruction: 'Hold the plank. The clock pauses if you break form.',
   },
   wallsit: {
     feature: 'fitness.squats',
     mode: 'hold',
-    unitLabel: 'held',
-    instruction: 'Hold the wall sit. The timer pauses if you stand up.',
+    instruction: 'Hold the wall sit. The clock pauses if you stand up.',
   },
 };
 
@@ -143,20 +140,18 @@ const INSIDE_FRAME_THRESHOLD = 0.5; // inside.* below this = out of frame
 const MAX_PLAUSIBLE_HOLD_SECONDS = 600; // 10 min straight is a static image
 const MIN_PLAUSIBLE_SEGMENT_MS = 750; // shorter than this is threshold jitter
 const MAX_JITTER_SEGMENT_RATIO = 0.5; // >half the segments being jitter
-
-function formatSeconds(totalSeconds: number): string {
-  const mins = Math.floor(totalSeconds / 60);
-  const secs = totalSeconds % 60;
-  return `${mins}:${String(secs).padStart(2, '0')}`;
-}
+/** How long the body can be out of frame before the "can't see you" overlay. */
+const LOST_TRACKING_MS = 1500;
 
 export function MatchInProgressScreen({ route, navigation }: Props) {
   const { matchId } = route.params;
   const { session } = useAuth();
+  const insets = useSafeAreaInsets();
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [challengeType, setChallengeType] = useState<ChallengeType | null>(null);
+  const [participants, setParticipants] = useState<MatchParticipantRow[]>([]);
   const [participantId, setParticipantId] = useState<string | null>(null);
   const [hasCameraPermission, setHasCameraPermission] = useState(false);
 
@@ -167,6 +162,8 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   const [heldSeconds, setHeldSeconds] = useState(0);
   const [isHolding, setIsHolding] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [outOfFrame, setOutOfFrame] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const [running, setRunning] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
@@ -180,6 +177,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   const fpsSamplesRef = useRef<number[]>([]);
   const frameCountRef = useRef(0);
   const outOfFrameCountRef = useRef(0);
+  const lastInFrameAtRef = useRef(Date.now());
   const feedbackCountsRef = useRef<Record<string, number>>({});
 
   const config = configFor(challengeType);
@@ -227,7 +225,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
         return;
       }
 
-      const [{ data: challengeData }, { data: participants }] =
+      const [{ data: challengeData }, { data: participantData }] =
         await Promise.all([
           supabase
             .from('challenges')
@@ -245,10 +243,10 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
       }
 
       setChallengeType((challengeData?.type as ChallengeType) ?? null);
+      const rows = (participantData ?? []) as MatchParticipantRow[];
+      setParticipants(rows);
 
-      const mine = ((participants ?? []) as MatchParticipantRow[]).find(
-        p => p.user_id === session?.user.id,
-      );
+      const mine = rows.find(p => p.user_id === session?.user.id);
       if (!mine) {
         setError("You aren't a participant in this match.");
       } else {
@@ -271,6 +269,19 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
     };
   }, [matchId, session]);
 
+  // The clock in the top-left pill. Half-second ticks so a whole second never
+  // visibly skips.
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    const id = setInterval(() => {
+      const started = startedAtRef.current ?? Date.now();
+      setElapsed(Math.floor((Date.now() - started) / 1000));
+    }, 500);
+    return () => clearInterval(id);
+  }, [running]);
+
   const handleUpdate = useCallback(
     (event: QuickPoseUpdateEvent) => {
       if (!config) {
@@ -283,9 +294,16 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
         fpsSamplesRef.current.push(fps);
       }
 
+      const now = Date.now();
       const inside = results[INSIDE_FEATURE];
       if (typeof inside === 'number' && inside < INSIDE_FRAME_THRESHOLD) {
         outOfFrameCountRef.current += 1;
+        if (now - lastInFrameAtRef.current > LOST_TRACKING_MS) {
+          setOutOfFrame(prev => (prev ? prev : true));
+        }
+      } else {
+        lastInFrameAtRef.current = now;
+        setOutOfFrame(prev => (prev ? false : prev));
       }
 
       // Form guidance from the SDK. Surfaced live and tallied into raw_metrics
@@ -305,7 +323,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
       }
 
       if (config.mode === 'hold') {
-        const snapshot = holdRef.current.update(probability, Date.now());
+        const snapshot = holdRef.current.update(probability, now);
         const seconds = Math.floor(snapshot.totalHeldMs / 1000);
         setHeldSeconds(prev => (prev === seconds ? prev : seconds));
         setIsHolding(prev =>
@@ -316,8 +334,8 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
 
       counterRef.current.count(probability, state => {
         if (state.type === 'poseComplete') {
-          const elapsed = Date.now() - (startedAtRef.current ?? Date.now());
-          repTimestampsRef.current.push(elapsed);
+          const elapsedMs = now - (startedAtRef.current ?? now);
+          repTimestampsRef.current.push(elapsedMs);
           setRepCount(state.count);
         }
       });
@@ -329,6 +347,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
     counterRef.current.reset();
     holdRef.current.reset();
     startedAtRef.current = Date.now();
+    lastInFrameAtRef.current = Date.now();
     repTimestampsRef.current = [];
     fpsSamplesRef.current = [];
     feedbackCountsRef.current = {};
@@ -338,6 +357,8 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
     setHeldSeconds(0);
     setIsHolding(false);
     setFeedback(null);
+    setOutOfFrame(false);
+    setElapsed(0);
     setRunning(true);
   };
 
@@ -485,72 +506,137 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
     setSubmitted(true);
   };
 
+  const exit = () => {
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+    } else {
+      navigation.navigate('Home');
+    }
+  };
+
+  const leave = () => {
+    if (!running) {
+      exit();
+      return;
+    }
+    Alert.alert(
+      'Leave the ring?',
+      "Your set so far won't be recorded. You can come back and start again.",
+      [
+        { text: 'Stay', style: 'cancel' },
+        { text: 'Leave', style: 'destructive', onPress: exit },
+      ],
+    );
+  };
+
   if (loading) {
     return <Loading />;
   }
 
+  const valueText = isHold ? formatSeconds(heldSeconds) : String(repCount);
+  const unit = challengeType ? EXERCISE_SCORE[challengeType] : 'REPS';
+
   if (submitted) {
     return (
-      <Center>
-        <Kicker>In the books</Kicker>
-        <Text style={styles.doneValue}>
-          {isHold ? formatSeconds(heldSeconds) : repCount}
-        </Text>
-        <Label>{isHold ? 'held' : 'reps'}</Label>
-        <Muted style={styles.doneNote}>
-          The decision lands the moment both results are in. Points move on
-          their own.
-        </Muted>
+      <View style={styles.screen}>
+        <View style={[styles.done, { paddingTop: insets.top + 66 }]}>
+          <Label size={11}>IN THE BOOKS</Label>
+          <Numeral size={120} color={colors.accent} style={styles.doneValue}>
+            {valueText}
+          </Numeral>
+          <Label size={12} color={colors.secondary} tracking={0.24}>
+            {unit}
+          </Label>
+          <Body muted style={styles.doneNote}>
+            The decision lands the moment both results are in. Points move on
+            their own.
+          </Body>
+        </View>
         {/* Results handles every state, including "still waiting on the
             other participant", so it is safe to offer immediately. */}
-        <PrimaryButton
-          style={styles.doneCta}
-          label="See the decision"
-          onPress={() => navigation.replace('Results', { matchId })}
-        />
-      </Center>
+        <Dock>
+          <Button
+            label="SEE THE DECISION"
+            onPress={() => navigation.replace('Results', { matchId })}
+          />
+        </Dock>
+      </View>
     );
   }
 
   if (challengeType && !config) {
     return (
-      <Center>
-        <Headline style={styles.blockedTitle}>Not on the card yet</Headline>
-        <Muted style={styles.blockedText}>
-          Camera verification covers push-ups, planks and wall sits.{' '}
-          {EXERCISE_LABEL[challengeType]} is a later round.
-        </Muted>
-      </Center>
+      <Blocked
+        icon="clock"
+        title={'NOT ON\nTHE CARD YET.'}
+        body={`Camera verification covers push-ups, planks and wall sits. ${EXERCISE_LABEL[challengeType]} is a later round.`}
+        onClose={exit}
+      />
     );
+  }
+
+  if (error && !participantId) {
+    return <Blocked icon="warning" title={'NO SEAT\nFOR YOU.'} body={error} onClose={exit} />;
   }
 
   if (sdkKeyMissing) {
     return (
-      <Center>
-        <Headline style={styles.blockedTitle}>QuickPose key missing</Headline>
-        <Muted style={styles.blockedText}>
-          Set QUICKPOSE_SDK_KEY in .env (register free at dev.quickpose.ai),
-          then restart Metro with --reset-cache.
-        </Muted>
-      </Center>
+      <Blocked
+        icon="warning"
+        title={'NO REF\nON DUTY.'}
+        body="QUICKPOSE_SDK_KEY is missing from .env. Register free at dev.quickpose.ai, then restart Metro with --reset-cache."
+        onClose={exit}
+      />
     );
   }
 
   if (!hasCameraPermission) {
     return (
-      <Center>
-        <Headline style={styles.blockedTitle}>Camera access needed</Headline>
-        <Muted style={styles.blockedText}>
-          The camera is the referee — it counts every rep so nobody has to take
-          your word for it. Allow camera access in Settings, then reopen this
-          screen.
-        </Muted>
-      </Center>
+      <Blocked
+        icon="camera"
+        title={'THE CAMERA\nIS THE REF.'}
+        body="It counts every rep so nobody has to take your word for it. Allow camera access in Settings, then come back."
+        onClose={exit}
+        action={
+          <Button
+            label="OPEN SETTINGS"
+            variant="secondary"
+            onPress={() => Linking.openSettings()}
+          />
+        }
+      />
     );
   }
 
+  const me = session?.user.id ?? null;
+  const opponent = participants.find(p => p.user_id !== me) ?? null;
+  const opponentScore =
+    opponent && challengeType ? scoreFor(opponent, challengeType) : null;
+  const opponentHandle = opponent ? peerHandle(opponent.user_id) : null;
+
+  let formMessage: string;
+  if (!running) {
+    formMessage = 'GET IN FRAME';
+  } else if (outOfFrame) {
+    formMessage = 'TRACKING PAUSED';
+  } else if (feedback) {
+    formMessage = feedback.toUpperCase();
+  } else if (isHold) {
+    formMessage = isHolding ? 'HOLD IT.' : 'GET BACK IN POSITION';
+  } else {
+    formMessage = 'FULL RANGE. KEEP GOING.';
+  }
+  const formGood =
+    running && !outOfFrame && !feedback && (!isHold || isHolding);
+
+  const dockBottom = Math.max(insets.bottom, space.xl) + space.xxl;
+  const topPad = { top: insets.top + space.md };
+  const stripPad = { top: insets.top + space.md + 44 };
+  const counterPad = { bottom: dockBottom + 56 + 40 };
+  const bottomPad = { bottom: dockBottom };
+
   return (
-    <View style={styles.container}>
+    <View style={styles.screen}>
       <QuickPoseView
         sdkKey={QUICKPOSE_SDK_KEY}
         features={
@@ -559,114 +645,277 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
             : [OVERLAY_FEATURE, INSIDE_FEATURE]
         }
         useFrontCamera
-        style={styles.camera}
+        style={StyleSheet.absoluteFill}
         onUpdate={running ? handleUpdate : undefined}
       />
 
-      <View style={styles.hud} pointerEvents="none">
-        <Text style={styles.hudValue}>
-          {isHold ? formatSeconds(heldSeconds) : repCount}
-        </Text>
-        <Text style={styles.hudUnit}>{config?.unitLabel ?? ''}</Text>
-        {isHold && running ? (
-          <Text style={isHolding ? styles.holding : styles.notHolding}>
-            {isHolding ? 'Holding' : 'Hold broken — get back in position'}
+      <View style={[styles.topRow, topPad]} pointerEvents="none">
+        <View style={styles.pill}>
+          {running ? (
+            <LiveDot color={colors.recording} size={8} period={1000} />
+          ) : (
+            <View style={styles.idleDot} />
+          )}
+          <Text style={styles.pillText}>
+            {running ? formatSeconds(elapsed) : 'READY'}
           </Text>
-        ) : null}
-        {feedback ? <Text style={styles.feedback}>{feedback}</Text> : null}
+        </View>
+        <View style={styles.pill}>
+          <Icon name="seal-check" size={14} color={colors.accent} contrast={colors.card} />
+          <Text style={[styles.pillText, styles.pillTextDim]}>VERIFIED LIVE</Text>
+        </View>
       </View>
 
-      <View style={styles.controls}>
-        {error ? <ErrorText style={styles.error}>{error}</ErrorText> : null}
-        {running ? (
-          <PrimaryButton
-            label="Finish the round"
-            onPress={finishSet}
-            loading={submitting}
-          />
-        ) : (
-          <>
-            {config ? (
-              <Text style={styles.instruction}>{config.instruction}</Text>
-            ) : null}
-            <PrimaryButton label="Start the round" onPress={startSet} />
-          </>
-        )}
+      {opponentHandle ? (
+        <View style={[styles.strip, stripPad]} pointerEvents="none">
+          <View style={styles.stripLeft}>
+            <Avatar initials={initialsOf(opponentHandle)} size={28} />
+            <Text style={styles.stripHandle}>{opponentHandle}</Text>
+          </View>
+          <View style={styles.stripRight}>
+            <Numeral size={28}>
+              {challengeType ? formatScore(opponentScore, challengeType) : '—'}
+            </Numeral>
+            <Label size={10} tracking={0.12}>
+              {opponentScore === null ? 'NOT IN YET' : unit}
+            </Label>
+          </View>
+        </View>
+      ) : null}
+
+      <View style={[styles.counter, counterPad]} pointerEvents="none">
+        <Label size={12} color={colors.secondary} tracking={0.24}>
+          {isHold ? 'HOLD' : 'REPS'}
+        </Label>
+        <Numeral size={isHold ? 120 : 200} style={styles.counterValue}>
+          {valueText}
+        </Numeral>
+        <View style={[styles.form, formGood ? styles.formGood : styles.formPlain]}>
+          <Text style={[styles.formText, formGood && styles.formTextGood]}>
+            {formMessage}
+          </Text>
+        </View>
+      </View>
+
+      {running && outOfFrame ? (
+        <View style={styles.lost} pointerEvents="none">
+          <View style={styles.lostTile}>
+            <Icon name="crosshair" size={30} color={colors.accent} />
+          </View>
+          <Display size={56} style={styles.lostHead}>
+            CAN'T{'\n'}SEE YOU.
+          </Display>
+          <Body muted style={styles.lostBody}>
+            Step back into frame. Counting is paused, the clock isn't. Reps out
+            of frame don't count.
+          </Body>
+          <View style={styles.lostClock}>
+            <Numeral size={40}>{formatSeconds(elapsed)}</Numeral>
+            <Label tracking={0.14}>STILL RUNNING</Label>
+          </View>
+        </View>
+      ) : null}
+
+      <View style={[styles.bottom, bottomPad]}>
+        {error ? (
+          <Notice icon="warning" style={styles.error}>
+            {error}
+          </Notice>
+        ) : null}
+        {!running && config ? (
+          <Text style={styles.instruction}>{config.instruction}</Text>
+        ) : null}
+        <View style={styles.bottomRow}>
+          <Pressable
+            onPress={leave}
+            accessibilityRole="button"
+            accessibilityLabel="Leave the ring"
+            style={({ pressed }) => [styles.leave, pressed && styles.leavePressed]}
+          >
+            <Icon name="x" size={20} color={colors.secondary} />
+          </Pressable>
+          {running ? (
+            <Button
+              label={isHold ? 'DROP & FINISH' : 'FINISH'}
+              variant="white"
+              icon="flag"
+              onPress={finishSet}
+              loading={submitting}
+              style={styles.mainButton}
+            />
+          ) : (
+            <Button
+              label="START THE ROUND"
+              onPress={startSet}
+              loading={submitting}
+              style={styles.mainButton}
+            />
+          )}
+        </View>
       </View>
     </View>
   );
 }
 
-/**
- * HUD type sits over live video, so it carries a hard 2px print offset in
- * the ground color for legibility — a second ink layer, not a blur.
- */
-const hudShadow = {
-  textShadowColor: colors.bg,
-  textShadowOffset: { width: 2, height: 2 },
-  textShadowRadius: 0,
-} as const;
+/** Full-screen stop: no camera, no key, wrong exercise. */
+function Blocked({
+  icon,
+  title,
+  body,
+  onClose,
+  action,
+}: {
+  icon: IconName;
+  title: string;
+  body: string;
+  onClose: () => void;
+  action?: React.ReactNode;
+}) {
+  const insets = useSafeAreaInsets();
+  return (
+    <View style={styles.screen}>
+      <View style={[styles.blocked, { paddingTop: insets.top + space.xxl }]}>
+        <View style={styles.lostTile}>
+          <Icon name={icon} size={30} color={colors.accent} />
+        </View>
+        <Display size={56} style={styles.lostHead}>
+          {title}
+        </Display>
+        <Body muted style={styles.lostBody}>
+          {body}
+        </Body>
+      </View>
+      <Dock style={styles.blockedDock}>
+        {action}
+        <Button label="BACK TO BOUTS" variant="card" onPress={onClose} />
+      </Dock>
+    </View>
+  );
+}
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.bg },
-  camera: { flex: 1 },
-  hud: {
+  screen: { flex: 1, backgroundColor: colors.bg },
+
+  topRow: {
     position: 'absolute',
-    top: space.lg,
+    left: space.lg,
+    right: space.lg,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  pill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.sm,
+    height: 34,
+    paddingHorizontal: space.md,
+    borderRadius: radius.pill,
+    backgroundColor: colors.glass,
+  },
+  idleDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: colors.dim,
+  },
+  pillText: { ...label(11, colors.text, 0.12) },
+  pillTextDim: { color: colors.secondary },
+
+  strip: {
+    position: 'absolute',
+    left: space.lg,
+    right: space.lg,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: space.sm + 2,
+    paddingHorizontal: 14,
+    borderRadius: radius.control,
+    backgroundColor: colors.glass,
+  },
+  stripLeft: { flexDirection: 'row', alignItems: 'center', gap: space.sm + 2 },
+  stripHandle: { ...label(12, colors.secondary, 0), textTransform: 'none' },
+  stripRight: { flexDirection: 'row', alignItems: 'baseline', gap: 6 },
+
+  counter: {
+    position: 'absolute',
     left: 0,
     right: 0,
     alignItems: 'center',
   },
-  hudValue: {
-    ...typography.numeral,
-    ...hudShadow,
-    fontSize: 88,
-    lineHeight: 88,
-    color: colors.accent,
+  counterValue: {
+    textShadowColor: colors.accentGlow,
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 40,
   },
-  hudUnit: { ...typography.label, ...hudShadow, color: colors.text },
-  holding: {
-    ...typography.label,
-    ...hudShadow,
-    marginTop: space.sm,
-    color: colors.accent,
-  },
-  notHolding: {
-    ...typography.label,
-    ...hudShadow,
-    marginTop: space.sm,
-    color: colors.text,
-    textAlign: 'center',
+  form: {
+    marginTop: 6,
+    height: 36,
     paddingHorizontal: space.lg,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  feedback: {
-    ...typography.body,
-    ...hudShadow,
-    fontWeight: '700',
-    marginTop: space.sm + 4,
-    color: colors.text,
-    textAlign: 'center',
-    paddingHorizontal: space.lg,
+  formGood: { backgroundColor: colors.accentTintStrong },
+  formPlain: { backgroundColor: colors.whiteTint },
+  formText: { ...label(13, colors.text, 0.08) },
+  formTextGood: { color: colors.accent },
+
+  lost: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: colors.overlay,
+    justifyContent: 'center',
+    paddingHorizontal: 28,
   },
+  lostTile: {
+    width: 64,
+    height: 64,
+    borderRadius: 18,
+    backgroundColor: colors.card,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  lostHead: { marginTop: space.xxl },
+  lostBody: { marginTop: 14 },
+  lostClock: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: space.sm,
+    marginTop: space.xxl,
+  },
+
+  bottom: {
+    position: 'absolute',
+    left: space.gutter,
+    right: space.gutter,
+  },
+  bottomRow: { flexDirection: 'row', gap: space.sm + 2 },
+  leave: {
+    width: 56,
+    height: 56,
+    borderRadius: radius.button,
+    backgroundColor: colors.glass,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  leavePressed: { opacity: 0.7 },
+  mainButton: { flex: 1 },
   instruction: {
-    ...typography.bodySm,
+    ...label(11, colors.secondary, 0.08),
     textAlign: 'center',
     marginBottom: space.md,
   },
-  controls: {
-    padding: space.lg - space.xs,
-    backgroundColor: colors.bgDeep,
-  },
-  error: { marginBottom: space.sm },
-  doneValue: {
-    ...typography.numeral,
-    fontSize: 72,
-    lineHeight: 72,
-    color: colors.accent,
-    marginTop: space.sm,
-  },
-  doneNote: { textAlign: 'center', marginTop: space.md },
-  doneCta: { marginTop: space.lg, alignSelf: 'stretch' },
-  blockedTitle: { textAlign: 'center', marginBottom: space.sm },
-  blockedText: { textAlign: 'center' },
+  error: { marginBottom: space.sm + 2 },
+
+  done: { flex: 1, paddingHorizontal: space.xxl },
+  doneValue: { marginTop: space.md },
+  doneNote: { marginTop: space.lg },
+
+  blocked: { flex: 1, paddingHorizontal: 28 },
+  blockedDock: { gap: space.sm + 2 },
 });

@@ -7,6 +7,7 @@ import React, {
 } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
+import { normalizeHandle } from '../lib/identity';
 
 interface AuthContextValue {
   session: Session | null;
@@ -15,10 +16,16 @@ interface AuthContextValue {
     email: string,
     password: string,
   ) => Promise<{ error: string | null }>;
+  /**
+   * `handle` is stored in the auth user's metadata. There is no public
+   * profile table yet, so this is the only place a display name can live
+   * without a schema change; only the user themself can read it back.
+   */
   signUpWithPassword: (
     email: string,
     password: string,
-  ) => Promise<{ error: string | null }>;
+    handle?: string,
+  ) => Promise<{ error: string | null; needsConfirmation: boolean }>;
   signOut: () => Promise<void>;
 }
 
@@ -54,9 +61,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         });
         return { error: error?.message ?? null };
       },
-      signUpWithPassword: async (email, password) => {
-        const { error } = await supabase.auth.signUp({ email, password });
-        return { error: error?.message ?? null };
+      signUpWithPassword: async (email, password, handle) => {
+        const normalized = handle ? normalizeHandle(handle) : '';
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: normalized ? { data: { handle: normalized } } : undefined,
+        });
+        return {
+          error: error?.message ?? null,
+          // With email confirmation on, Supabase returns a user but no
+          // session; the account exists and needs the link tapped.
+          needsConfirmation: !error && !data.session,
+        };
       },
       signOut: async () => {
         await supabase.auth.signOut();
