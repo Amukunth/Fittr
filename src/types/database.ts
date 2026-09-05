@@ -10,7 +10,22 @@ export type ChallengeType = 'pushups' | 'plank' | 'wallsit' | 'race';
 
 export type ChallengeFormat = 'pooled' | '1v1';
 
-export type ChallengeStatus = 'open' | 'matched' | 'in_progress' | 'completed';
+export type ChallengeStatus =
+  | 'open'
+  | 'matched'
+  | 'in_progress'
+  | 'completed'
+  // Settlement found an anomaly_flag on the session that decided the outcome.
+  // No payout happened and matches.settled_at is still null.
+  | 'needs_review';
+
+/** Return values of the settle_match() RPC. */
+export type SettlementOutcome =
+  | 'settled'
+  | 'tie_refunded'
+  | 'needs_review'
+  | 'not_ready'
+  | 'already_settled';
 
 export type LedgerReason = 'stake' | 'payout' | 'bonus';
 

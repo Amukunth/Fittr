@@ -1,0 +1,18 @@
+-- Adds 'needs_review' to ChallengeStatus.
+--
+-- DELIBERATELY ALONE IN ITS OWN MIGRATION. Prisma wraps each migration file
+-- in a transaction, and Postgres forbids *using* an enum value in the same
+-- transaction that adds it ("unsafe use of new value"). settle_match() only
+-- names 'needs_review' inside a plpgsql body (parsed at call time, not at
+-- CREATE FUNCTION time), so co-locating them would probably work — but
+-- "probably" is not worth it for a one-line DDL. Splitting makes it
+-- impossible to hit.
+--
+-- Appended rather than inserted BEFORE 'completed': enum position only
+-- affects ORDER BY on the enum, nothing sorts by status, and appending
+-- avoids any table rewrite.
+--
+-- Meaning: a match whose result was decided by a session the client itself
+-- flagged as anomalous. Points are NOT paid out and matches.settled_at stays
+-- NULL. See settle_match() in the next migration for the resolution path.
+ALTER TYPE "ChallengeStatus" ADD VALUE IF NOT EXISTS 'needs_review';

@@ -67,6 +67,10 @@ enum ChallengeStatus {
   matched
   in_progress
   completed
+  /// Result decided by a session the client flagged as anomalous. Points are
+  /// NOT paid out and Match.settledAt stays null until a reviewer sets
+  /// VerificationSession.reviewed. See settle_match() in the migrations.
+  needs_review
 }
 
 enum LedgerReason {

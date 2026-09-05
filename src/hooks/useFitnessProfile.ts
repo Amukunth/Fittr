@@ -8,6 +8,14 @@ interface UseFitnessProfileResult {
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
+  /**
+   * Adopt an already-complete row without refetching — for Realtime UPDATE
+   * payloads, whose `new` is the full new tuple regardless of replica
+   * identity. Deliberately not `refresh()`: that flips `loading` back to
+   * true, and consumers gate a full-screen spinner on it, so using it for a
+   * live balance tick would flash the whole screen on every stake.
+   */
+  applyRow: (row: FitnessProfileRow) => void;
 }
 
 /**
@@ -87,9 +95,13 @@ export function useFitnessProfile(): UseFitnessProfileResult {
     setLoading(false);
   }, [userId]);
 
+  const applyRow = useCallback((row: FitnessProfileRow) => {
+    setProfile(row);
+  }, []);
+
   useEffect(() => {
     load();
   }, [load]);
 
-  return { profile, loading, error, refresh: load };
+  return { profile, loading, error, refresh: load, applyRow };
 }

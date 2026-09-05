@@ -1,17 +1,24 @@
 import React, { useState } from 'react';
-import {
-  ActivityIndicator,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { StyleSheet } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import type { RootStackParamList } from '../navigation/types';
 import type { ChallengeFormat, ChallengeType } from '../types/database';
+import { colors, space, typography } from '../theme/tokens';
+import { EXERCISE_LABEL, FORMAT_LABEL } from '../theme/copy';
+import {
+  Chip,
+  ChipRow,
+  ErrorText,
+  Headline,
+  Input,
+  Kicker,
+  Label,
+  Muted,
+  PrimaryButton,
+  Screen,
+} from '../theme/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'CreateChallenge'>;
 
@@ -30,7 +37,7 @@ export function CreateChallengeScreen({ navigation }: Props) {
     setError(null);
     const stakePoints = parseInt(stake, 10);
     if (!Number.isFinite(stakePoints) || stakePoints <= 0) {
-      setError('Enter a stake amount greater than zero.');
+      setError('Put something on the line — the stake has to be more than zero.');
       return;
     }
     if (!session) {
@@ -60,94 +67,65 @@ export function CreateChallengeScreen({ navigation }: Props) {
   };
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.label}>Type</Text>
-      <View style={styles.pillRow}>
+    <Screen>
+      <Kicker>Set the terms</Kicker>
+      <Headline>Name your bout</Headline>
+      <Muted style={styles.lede}>
+        Both corners put up the stake. Winner takes the pot.
+      </Muted>
+
+      <Label style={styles.fieldLabel}>Exercise</Label>
+      <ChipRow>
         {TYPES.map(option => (
-          <TouchableOpacity
+          <Chip
             key={option}
-            style={[styles.pill, type === option && styles.pillActive]}
+            label={EXERCISE_LABEL[option]}
+            active={type === option}
             onPress={() => setType(option)}
-          >
-            <Text style={[styles.pillText, type === option && styles.pillTextActive]}>
-              {option}
-            </Text>
-          </TouchableOpacity>
+          />
         ))}
-      </View>
+      </ChipRow>
 
-      <Text style={styles.label}>Format</Text>
-      <View style={styles.pillRow}>
+      <Label style={styles.fieldLabel}>Format</Label>
+      <ChipRow>
         {FORMATS.map(option => (
-          <TouchableOpacity
+          <Chip
             key={option}
-            style={[styles.pill, format === option && styles.pillActive]}
+            label={FORMAT_LABEL[option]}
+            active={format === option}
             onPress={() => setFormat(option)}
-          >
-            <Text style={[styles.pillText, format === option && styles.pillTextActive]}>
-              {option}
-            </Text>
-          </TouchableOpacity>
+          />
         ))}
-      </View>
+      </ChipRow>
 
-      <Text style={styles.label}>Stake (points)</Text>
-      <TextInput
-        style={styles.input}
+      <Label style={styles.fieldLabel}>Stake · pts on the line</Label>
+      <Input
+        style={styles.stakeInput}
         keyboardType="number-pad"
         value={stake}
         onChangeText={setStake}
       />
 
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <ErrorText style={styles.error}>{error}</ErrorText> : null}
 
-      <TouchableOpacity
-        style={styles.primaryButton}
+      <PrimaryButton
+        style={styles.cta}
+        label="Post the bout"
         onPress={submit}
-        disabled={submitting}
-      >
-        {submitting ? (
-          <ActivityIndicator color="#fff" />
-        ) : (
-          <Text style={styles.primaryButtonText}>Post Challenge</Text>
-        )}
-      </TouchableOpacity>
-    </View>
+        loading={submitting}
+      />
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 20, backgroundColor: '#fff' },
-  label: { fontSize: 14, fontWeight: '600', color: '#374151', marginTop: 16, marginBottom: 8 },
-  pillRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  pill: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: '#D1D5DB',
-    marginRight: 8,
-    marginBottom: 8,
+  lede: { marginTop: space.sm },
+  fieldLabel: { marginTop: space.lg, marginBottom: space.sm },
+  stakeInput: {
+    ...typography.stat,
+    color: colors.accent,
+    paddingVertical: space.sm + 2,
   },
-  pillActive: { backgroundColor: '#E11D48', borderColor: '#E11D48' },
-  pillText: { color: '#374151', textTransform: 'capitalize' },
-  pillTextActive: { color: '#fff', fontWeight: '700' },
-  input: {
-    backgroundColor: '#F9FAFB',
-    borderWidth: 1,
-    borderColor: '#D1D5DB',
-    borderRadius: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    fontSize: 16,
-  },
-  error: { color: '#DC2626', marginTop: 16 },
-  primaryButton: {
-    backgroundColor: '#E11D48',
-    borderRadius: 10,
-    paddingVertical: 16,
-    alignItems: 'center',
-    marginTop: 32,
-  },
-  primaryButtonText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  error: { marginTop: space.md },
+  cta: { marginTop: space.xl },
 });

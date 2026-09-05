@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
   FlatList,
+  Pressable,
   RefreshControl,
   StyleSheet,
   Text,
@@ -14,13 +14,25 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import type { RootStackParamList } from '../navigation/types';
 import type { ChallengeRow } from '../types/database';
+import { colors, radius, space, typography } from '../theme/tokens';
+import { EXERCISE_LABEL, FORMAT_LABEL } from '../theme/copy';
+import {
+  ErrorText,
+  Kicker,
+  Loading,
+  Muted,
+  Plate,
+  PrimaryButton,
+  Screen,
+  Subhead,
+} from '../theme/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
 function ProfileHeaderLink({ navigation }: Pick<Props, 'navigation'>) {
   return (
     <TouchableOpacity onPress={() => navigation.navigate('Profile')}>
-      <Text style={styles.headerLink}>Profile</Text>
+      <Text style={styles.headerLink}>My corner</Text>
     </TouchableOpacity>
   );
 }
@@ -54,12 +66,57 @@ export function HomeScreen({ navigation }: Props) {
   }, [load]);
 
   // Re-pull whenever the screen regains focus (e.g. after creating a
-  // challenge or backing out of a match) instead of wiring realtime for v1.
+  // challenge or backing out of a match). Still worth keeping alongside the
+  // realtime subscription below: it re-syncs after the socket has been down
+  // (backgrounded app, lost network), which is exactly when live events were
+  // missed rather than merely late.
   useFocusEffect(
     useCallback(() => {
       load();
     }, [load]),
   );
+
+  // This list is `status = 'open'`, and join_challenge() flips challenges to
+  // 'matched' out from under it — so without this a card stays tappable after
+  // someone else has already taken it, and Accept fails with "challenge is
+  // not open". Unfiltered by design: Home shows the whole open marketplace,
+  // so every challenge row is relevant here.
+  useEffect(() => {
+    const channel = supabase
+      .channel('home-open-challenges')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'challenges' },
+        payload => {
+          const row = payload.new as ChallengeRow;
+          if (row.status !== 'open') {
+            return;
+          }
+          setChallenges(prev =>
+            // Guard against the echo of our own insert arriving after the
+            // post-create focus refetch has already added it.
+            prev.some(c => c.id === row.id) ? prev : [row, ...prev],
+          );
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'challenges' },
+        payload => {
+          const row = payload.new as ChallengeRow;
+          setChallenges(prev =>
+            row.status === 'open'
+              ? prev.map(c => (c.id === row.id ? row : c))
+              : prev.filter(c => c.id !== row.id),
+          );
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
 
   React.useLayoutEffect(() => {
     navigation.setOptions({
@@ -68,15 +125,11 @@ export function HomeScreen({ navigation }: Props) {
   }, [navigation]);
 
   if (loading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" />
-      </View>
-    );
+    return <Loading />;
   }
 
   return (
-    <View style={styles.container}>
+    <Screen style={styles.container}>
       <FlatList
         data={challenges}
         keyExtractor={item => item.id}
@@ -88,88 +141,93 @@ export function HomeScreen({ navigation }: Props) {
               setRefreshing(true);
               load();
             }}
+            tintColor={colors.accent}
+            colors={[colors.accent]}
+            progressBackgroundColor={colors.surfaceRaised}
           />
         }
-        ListEmptyComponent={
-          <Text style={styles.emptyText}>
-            No open challenges right now. Create one to get started.
-          </Text>
+        ListHeaderComponent={
+          <View style={styles.listHeader}>
+            <Kicker>Open bouts</Kicker>
+            <Muted>Somebody in your group chat is about to lose.</Muted>
+            {error ? <ErrorText style={styles.error}>{error}</ErrorText> : null}
+          </View>
         }
-        ListHeaderComponent={error ? <Text style={styles.error}>{error}</Text> : undefined}
+        ListEmptyComponent={
+          <Plate style={styles.empty}>
+            <Subhead>Nothing on the card</Subhead>
+            <Muted style={styles.emptyBody}>
+              No open bouts right now. Call somebody out and yours goes up
+              first.
+            </Muted>
+          </Plate>
+        }
         renderItem={({ item }) => (
-          <TouchableOpacity
-            style={styles.card}
+          <Pressable
             onPress={() =>
               navigation.navigate('ChallengeDetail', { challengeId: item.id })
             }
+            accessibilityRole="button"
+            style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
           >
             <View style={styles.cardRow}>
-              <Text style={styles.cardType}>{formatType(item.type)}</Text>
-              <Text style={styles.cardFormat}>{item.format}</Text>
+              <Text style={styles.cardType}>{EXERCISE_LABEL[item.type]}</Text>
+              <Text style={styles.cardFormat}>{FORMAT_LABEL[item.format]}</Text>
             </View>
-            <Text style={styles.cardStake}>{item.stake_points} pts stake</Text>
+            <View style={styles.cardStakeRow}>
+              <Text style={styles.cardStake}>{item.stake_points}</Text>
+              <Text style={styles.cardStakeUnit}>pts on the line</Text>
+            </View>
             {item.created_by === session?.user.id ? (
-              <Text style={styles.ownBadge}>Your challenge</Text>
+              <Text style={styles.ownBadge}>Your call-out</Text>
             ) : null}
-          </TouchableOpacity>
+          </Pressable>
         )}
       />
-      <TouchableOpacity
+      <PrimaryButton
         style={styles.fab}
+        label="Call someone out"
         onPress={() => navigation.navigate('CreateChallenge')}
-      >
-        <Text style={styles.fabText}>+ New Challenge</Text>
-      </TouchableOpacity>
-    </View>
+      />
+    </Screen>
   );
 }
 
-function formatType(type: ChallengeRow['type']): string {
-  switch (type) {
-    case 'pushups':
-      return 'Push-ups';
-    case 'plank':
-      return 'Plank';
-    case 'wallsit':
-      return 'Wall Sit';
-    case 'race':
-      return 'Race';
-  }
-}
-
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff' },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  listContent: { padding: 16, paddingBottom: 96 },
-  emptyText: { textAlign: 'center', color: '#6B7280', marginTop: 40 },
-  error: { color: '#DC2626', marginBottom: 12 },
+  container: { padding: 0 },
+  listContent: { padding: space.md, paddingBottom: 120 },
+  listHeader: { marginBottom: space.md, gap: space.xs },
+  error: { marginTop: space.sm },
+  empty: { marginTop: space.md },
+  emptyBody: { marginTop: space.sm },
   card: {
-    backgroundColor: '#F9FAFB',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    padding: space.md + 2,
+    marginBottom: space.sm + 2,
   },
+  cardPressed: { backgroundColor: colors.surfaceRaised },
   cardRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 6,
+    alignItems: 'flex-start',
   },
-  cardType: { fontSize: 18, fontWeight: '700' },
-  cardFormat: { fontSize: 14, color: '#6B7280', textTransform: 'uppercase' },
-  cardStake: { fontSize: 16, color: '#111827' },
-  ownBadge: { marginTop: 6, color: '#E11D48', fontWeight: '600' },
+  cardType: { ...typography.subhead },
+  cardFormat: { ...typography.label, marginTop: space.xs },
+  cardStakeRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: space.sm,
+    marginTop: space.sm,
+  },
+  cardStake: { ...typography.stat, color: colors.accent },
+  cardStakeUnit: { ...typography.label },
+  ownBadge: { ...typography.label, color: colors.accent, marginTop: space.sm },
   fab: {
     position: 'absolute',
-    bottom: 24,
-    left: 16,
-    right: 16,
-    backgroundColor: '#E11D48',
-    borderRadius: 12,
-    paddingVertical: 16,
-    alignItems: 'center',
+    bottom: space.lg,
+    left: space.md,
+    right: space.md,
   },
-  fabText: { color: '#fff', fontWeight: '700', fontSize: 16 },
-  headerLink: { color: '#E11D48', fontWeight: '600', marginRight: 8 },
+  headerLink: { ...typography.label, color: colors.accent, marginRight: space.sm },
 });

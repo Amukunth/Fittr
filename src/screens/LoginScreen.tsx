@@ -1,14 +1,24 @@
 import React, { useState } from 'react';
 import {
-  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
 } from 'react-native';
 import { useAuth } from '../context/AuthContext';
+import { colors, space, typography } from '../theme/tokens';
+import {
+  Body,
+  ErrorText,
+  Headline,
+  Input,
+  Kicker,
+  Label,
+  Muted,
+  PrimaryButton,
+  Wordmark,
+} from '../theme/ui';
 
 export function LoginScreen() {
   const { signInWithPassword, signUpWithPassword } = useAuth();
@@ -37,52 +47,52 @@ export function LoginScreen() {
     if (result.error) {
       setError(result.error);
     } else if (mode === 'sign-up') {
-      setInfo('Account created. Check your email to confirm, then sign in.');
+      setInfo('Account created. Confirm it from your email, then log in.');
     }
   };
+
+  const signingIn = mode === 'sign-in';
 
   return (
     <KeyboardAvoidingView
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
-      <Text style={styles.title}>Fittr</Text>
-      <Text style={styles.subtitle}>
-        {mode === 'sign-in' ? 'Log in' : 'Create an account'}
-      </Text>
+      <Wordmark size={56} />
+      <Kicker style={styles.kicker}>Verified, not guessed.</Kicker>
 
-      <TextInput
-        style={styles.input}
-        placeholder="Email"
+      <Headline>{signingIn ? 'Back in the ring' : 'Weigh in'}</Headline>
+      <Muted style={styles.lede}>
+        {signingIn
+          ? 'Log in. Somebody on the card is waiting on you.'
+          : 'Make your account, then call somebody out.'}
+      </Muted>
+
+      <Label style={styles.fieldLabel}>Email</Label>
+      <Input
+        placeholder="you@example.com"
         autoCapitalize="none"
         keyboardType="email-address"
         value={email}
         onChangeText={setEmail}
       />
-      <TextInput
-        style={styles.input}
-        placeholder="Password"
+      <Label style={styles.fieldLabel}>Password</Label>
+      <Input
+        placeholder="••••••••"
         secureTextEntry
         value={password}
         onChangeText={setPassword}
       />
 
-      {error ? <Text style={styles.error}>{error}</Text> : null}
-      {info ? <Text style={styles.info}>{info}</Text> : null}
+      {error ? <ErrorText style={styles.message}>{error}</ErrorText> : null}
+      {info ? <Body style={styles.message}>{info}</Body> : null}
 
-      <TouchableOpacity
-        style={styles.primaryButton}
+      <PrimaryButton
+        style={styles.cta}
+        label={signingIn ? 'Log in' : 'Create account'}
         onPress={submit}
-        disabled={submitting}
-      >
-        {submitting ? (
-          <ActivityIndicator color="#fff" />
-        ) : (
-          <Text style={styles.primaryButtonText}>
-            {mode === 'sign-in' ? 'Log in' : 'Sign up'}
-          </Text>
-        )}
-      </TouchableOpacity>
+        loading={submitting}
+      />
 
       <TouchableOpacity
         onPress={() => {
@@ -92,9 +102,7 @@ export function LoginScreen() {
         }}
       >
         <Text style={styles.switchModeText}>
-          {mode === 'sign-in'
-            ? "Don't have an account? Sign up"
-            : 'Already have an account? Log in'}
+          {signingIn ? 'First time here? Weigh in' : 'Already weighed in? Log in'}
         </Text>
       </TouchableOpacity>
     </KeyboardAvoidingView>
@@ -105,52 +113,17 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     justifyContent: 'center',
-    paddingHorizontal: 24,
-    backgroundColor: '#0B0B0F',
+    paddingHorizontal: space.lg,
+    backgroundColor: colors.bg,
   },
-  title: {
-    fontSize: 40,
-    fontWeight: '800',
-    color: '#fff',
-    marginBottom: 4,
-  },
-  subtitle: {
-    fontSize: 16,
-    color: '#9CA3AF',
-    marginBottom: 24,
-  },
-  input: {
-    backgroundColor: '#1A1B22',
-    color: '#fff',
-    borderRadius: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    marginBottom: 12,
-    fontSize: 16,
-  },
-  error: {
-    color: '#F87171',
-    marginBottom: 12,
-  },
-  info: {
-    color: '#34D399',
-    marginBottom: 12,
-  },
-  primaryButton: {
-    backgroundColor: '#E11D48',
-    borderRadius: 10,
-    paddingVertical: 16,
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  primaryButtonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '700',
-  },
+  kicker: { marginTop: space.md, marginBottom: space.xl },
+  lede: { marginTop: space.sm, marginBottom: space.lg },
+  fieldLabel: { marginTop: space.md, marginBottom: space.sm },
+  message: { marginTop: space.md },
+  cta: { marginTop: space.lg },
   switchModeText: {
-    color: '#9CA3AF',
+    ...typography.bodySm,
     textAlign: 'center',
-    marginTop: 20,
+    marginTop: space.lg,
   },
 });

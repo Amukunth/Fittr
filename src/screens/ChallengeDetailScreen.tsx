@@ -1,11 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import {
-  ActivityIndicator,
-  StyleSheet,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
 import { supabase } from '../lib/supabase';
@@ -16,6 +10,21 @@ import type {
   MatchParticipantRow,
   MatchRow,
 } from '../types/database';
+import { space, typography } from '../theme/tokens';
+import { EXERCISE_LABEL, FORMAT_LABEL, STATUS_LABEL } from '../theme/copy';
+import {
+  Center,
+  ErrorText,
+  Kicker,
+  Loading,
+  Muted,
+  Plate,
+  PrimaryButton,
+  Screen,
+  Stat,
+  Subhead,
+  TapeRow,
+} from '../theme/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'ChallengeDetail'>;
 
@@ -45,18 +54,30 @@ export function ChallengeDetailScreen({ route, navigation }: Props) {
     }
     setChallenge(challengeData as ChallengeRow);
 
-    const { data: matchData } = await supabase
+    // Do NOT drop these errors. The RLS-recursion bug (see migration
+    // 20260904000000) hid here: the read failed, `match` stayed null, so the
+    // screen showed "Status: matched" with no Go to Match button and no
+    // message. A missing match on an 'open' challenge is still a clean
+    // null-with-no-error from maybeSingle(), so surfacing errors changes
+    // nothing on the happy path.
+    const { data: matchData, error: matchError } = await supabase
       .from('matches')
       .select('*')
       .eq('challenge_id', challengeId)
       .maybeSingle();
 
-    if (matchData) {
+    if (matchError) {
+      setError(`Couldn't load match: ${matchError.message}`);
+    } else if (matchData) {
       setMatch(matchData as MatchRow);
-      const { data: participantsData } = await supabase
-        .from('match_participants')
-        .select('*')
-        .eq('match_id', matchData.id);
+      const { data: participantsData, error: participantsError } =
+        await supabase
+          .from('match_participants')
+          .select('*')
+          .eq('match_id', matchData.id);
+      if (participantsError) {
+        setError(`Couldn't load participants: ${participantsError.message}`);
+      }
       setParticipants((participantsData ?? []) as MatchParticipantRow[]);
     }
 
@@ -73,120 +94,175 @@ export function ChallengeDetailScreen({ route, navigation }: Props) {
     }, [load]),
   );
 
+  // Keep this screen's status/participants live. Matters for a viewer who is
+  // sitting on someone else's challenge when a third user accepts it — the
+  // app-level MatchFoundWatcher only fires for the creator, and without this
+  // the Accept button would stay tappable against an already-matched
+  // challenge until the next focus event.
+  useEffect(() => {
+    const channel = supabase
+      .channel(`challenge-detail:${challengeId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'challenges',
+          filter: `id=eq.${challengeId}`,
+        },
+        payload => {
+          const next = payload.new as ChallengeRow;
+          setChallenge(next);
+          // Status moved off 'open', so a Match now exists (or its results
+          // landed). Re-pull to pick up the match row and participants.
+          if (next.status !== 'open') {
+            load();
+          }
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [challengeId, load]);
+
   const join = async () => {
     if (!session) {
       return;
     }
     setJoining(true);
     setError(null);
-    const { error: rpcError } = await supabase.rpc('join_challenge', {
-      p_challenge_id: challengeId,
-      p_user_id: session.user.id,
-    });
+
+    // join_challenge() RETURNS the new match's uuid, so the joiner never has
+    // to re-query for it — by the time this resolves the Match, both
+    // MatchParticipants and both stake deductions are already committed.
+    const { data: matchId, error: rpcError } = await supabase.rpc(
+      'join_challenge',
+      { p_challenge_id: challengeId, p_user_id: session.user.id },
+    );
     setJoining(false);
 
     if (rpcError) {
       setError(rpcError.message);
       return;
     }
+
+    if (typeof matchId === 'string') {
+      // replace, not navigate: leaving ChallengeDetail on the stack would
+      // mean MatchInProgress's "Done" (which replaces itself with
+      // ChallengeDetail) stacks a duplicate of this screen behind it.
+      navigation.replace('MatchInProgress', { matchId });
+      return;
+    }
+
+    // Defensive: the join committed but we somehow got no id back. Fall back
+    // to the old refetch so the "Go to Match" button still appears.
     await load();
   };
 
   if (loading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" />
-      </View>
-    );
+    return <Loading />;
   }
 
   if (!challenge) {
     return (
-      <View style={styles.center}>
-        <Text style={styles.error}>{error ?? 'Challenge not found.'}</Text>
-      </View>
+      <Center>
+        <ErrorText>{error ?? "That bout isn't on the card."}</ErrorText>
+      </Center>
     );
   }
 
   const isOwnChallenge = challenge.created_by === session?.user.id;
   const canJoin = challenge.status === 'open' && !isOwnChallenge;
+  const decided =
+    challenge.status === 'completed' || challenge.status === 'needs_review';
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.type}>{challenge.type}</Text>
-      <Text style={styles.meta}>
-        {challenge.format} · {challenge.stake_points} pts stake
-      </Text>
-      <Text style={styles.status}>Status: {challenge.status}</Text>
+    <Screen>
+      <Kicker>
+        {STATUS_LABEL[challenge.status]}
+        {isOwnChallenge ? ' · Your call-out' : ''}
+      </Kicker>
+      <Text style={typography.display}>{EXERCISE_LABEL[challenge.type]}</Text>
 
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      <View style={styles.tape}>
+        <Plate raised style={styles.tapePlate}>
+          <Stat label="Stake" value={`${challenge.stake_points} pts`} accent />
+        </Plate>
+        <Plate raised style={styles.tapePlate}>
+          <Stat label="Format" value={FORMAT_LABEL[challenge.format]} />
+        </Plate>
+      </View>
+
+      {challenge.status === 'open' && isOwnChallenge ? (
+        <Muted style={styles.note}>
+          Posted. Waiting on somebody to take it.
+        </Muted>
+      ) : null}
+
+      {error ? <ErrorText style={styles.error}>{error}</ErrorText> : null}
 
       {match && (
-        <View style={styles.participants}>
-          <Text style={styles.sectionTitle}>Participants</Text>
-          {participants.map(p => (
-            <Text key={p.id} style={styles.participant}>
-              {p.user_id === session?.user.id ? 'You' : p.user_id.slice(0, 8)}
-            </Text>
-          ))}
+        <View style={styles.section}>
+          <Subhead style={styles.sectionTitle}>Tale of the tape</Subhead>
+          <Plate>
+            {participants.map((p, i) => (
+              <TapeRow
+                key={p.id}
+                left={
+                  p.user_id === session?.user.id ? 'You' : p.user_id.slice(0, 8)
+                }
+                last={i === participants.length - 1}
+              />
+            ))}
+          </Plate>
         </View>
       )}
 
       {canJoin && (
-        <TouchableOpacity
-          style={styles.primaryButton}
+        <PrimaryButton
+          style={styles.cta}
+          label={`Accept the bout · ${challenge.stake_points} pts`}
           onPress={join}
-          disabled={joining}
-        >
-          {joining ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.primaryButtonText}>
-              Accept ({challenge.stake_points} pts)
-            </Text>
-          )}
-        </TouchableOpacity>
+          loading={joining}
+        />
       )}
 
       {match && challenge.status === 'matched' && (
-        <TouchableOpacity
-          style={styles.primaryButton}
+        <PrimaryButton
+          style={styles.cta}
+          label="Enter the ring"
           onPress={() =>
             navigation.navigate('MatchInProgress', { matchId: match.id })
           }
-        >
-          <Text style={styles.primaryButtonText}>Go to Match</Text>
-        </TouchableOpacity>
+        />
       )}
 
-      {match && challenge.status === 'completed' && (
-        <TouchableOpacity
-          style={styles.primaryButton}
+      {/* needs_review is a settled-enough state to have results worth
+          showing (scores are in, the payout is just held) — gating only on
+          'completed' would make a flagged match unreachable from here. */}
+      {match && decided && (
+        <PrimaryButton
+          style={styles.cta}
+          label={
+            challenge.status === 'needs_review'
+              ? 'See the decision · under review'
+              : 'See the decision'
+          }
           onPress={() => navigation.navigate('Results', { matchId: match.id })}
-        >
-          <Text style={styles.primaryButtonText}>View Results</Text>
-        </TouchableOpacity>
+        />
       )}
-    </View>
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 20, backgroundColor: '#fff' },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  type: { fontSize: 28, fontWeight: '800', textTransform: 'capitalize' },
-  meta: { fontSize: 16, color: '#6B7280', marginTop: 4, textTransform: 'capitalize' },
-  status: { fontSize: 14, color: '#111827', marginTop: 12, fontWeight: '600' },
-  error: { color: '#DC2626', marginTop: 16 },
-  sectionTitle: { fontSize: 14, fontWeight: '700', marginBottom: 8, color: '#374151' },
-  participants: { marginTop: 24 },
-  participant: { fontSize: 15, color: '#111827', paddingVertical: 4 },
-  primaryButton: {
-    backgroundColor: '#E11D48',
-    borderRadius: 10,
-    paddingVertical: 16,
-    alignItems: 'center',
-    marginTop: 32,
-  },
-  primaryButtonText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  tape: { flexDirection: 'row', gap: space.sm + 2, marginTop: space.lg },
+  tapePlate: { flex: 1 },
+  note: { marginTop: space.md },
+  error: { marginTop: space.md },
+  section: { marginTop: space.xl },
+  sectionTitle: { marginBottom: space.sm + 2 },
+  cta: { marginTop: space.xl },
 });

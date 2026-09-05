@@ -180,15 +180,249 @@ either use macOS/Linux/WSL or hand-write the diff with paths relative to the
 package root — patch-package applies effects with cwd set to the project
 root.
 
+## Realtime: live match notifications
+
+`join_challenge()` is called by the *joiner*, so nothing on the *creator's*
+device knows a Match now exists. Before this was wired, both sides were
+served by `useFocusEffect` refetches only: the joiner had to tap a second
+"Go to Match" button, and the creator found out whenever they next happened
+to navigate. The fix is Supabase Realtime on two tables, added to the
+`supabase_realtime` publication by
+`prisma/migrations/20260903100000_enable_realtime/migration.sql`.
+
+**That publication ships EMPTY.** Postgres changes are only broadcast for
+tables explicitly added to it, so subscription code against a table that
+isn't a member connects, reports `SUBSCRIBED`, and then silently never
+fires. That failure mode looks exactly like a client bug; check publication
+membership first.
+
+Who subscribes to what:
+
+| Screen / component | Channel | Subscription |
+| --- | --- | --- |
+| `MatchFoundWatcher` (app-level, inside `NavigationContainer`) | `match-watch:<uid>` | `challenges` UPDATE, `created_by=eq.<uid>` |
+| `HomeScreen` | `home-open-challenges` | `challenges` INSERT + UPDATE, unfiltered |
+| `ChallengeDetailScreen` | `challenge-detail:<challengeId>` | `challenges` UPDATE, `id=eq.<challengeId>` |
+| `ProfileScreen` | `fitness-profile:<uid>` | `fitness_profiles` UPDATE, `user_id=eq.<uid>` |
+
+`MatchFoundWatcher` is mounted as a sibling of the navigator rather than on
+a screen, because the creator can be anywhere when the accept lands; it
+reaches navigation through `src/lib/navigationRef.ts`. It auto-navigates,
+except on `MatchInProgress` (a live camera capture — navigating away would
+destroy an in-flight set and its unsaved rep count) and `Results`, where it
+shows a dismissible banner instead.
+
+Every subscription tears down with `supabase.removeChannel(channel)`, not
+just `unsubscribe()`, so the topic name is released for remount.
+
+### Known limitation: no catch-up on resubscribe
+
+**This is deliberate, not an oversight.** Realtime delivers only what
+happens while the socket is actually connected. There is no replay on
+resubscribe, and none of the subscriptions above run a catch-up query when
+they reconnect. Consequences:
+
+- A creator whose app is backgrounded (or offline, or on a dropped socket)
+  when someone accepts their challenge is **not** notified on resume. They
+  find out on the next `useFocusEffect` refetch — i.e. the next time they
+  navigate to Home or the challenge — not instantly.
+- The `useFocusEffect` refetches were kept alongside realtime for exactly
+  this reason. They are not redundant: they are the resync path for the
+  window in which live events were *missed* rather than merely late.
+
+A catch-up query on `SUBSCRIBED` was considered and rejected: for
+`MatchFoundWatcher` it would mean querying for already-`matched` challenges
+on every app launch and then auto-navigating the creator into an old match
+they'd already played. Correcting for that needs "has this user been
+notified about this match yet" state that doesn't exist in the schema.
+
+**The real fix is push notifications** (APNs/FCM via a Supabase Edge
+Function or database webhook on the `challenges` status transition), which
+is the only mechanism that reaches a backgrounded or killed app at all.
+That's out of scope for now — it needs credentials, native config, and a
+server-side trigger, none of which exist in this project yet. Realtime
+covers the foreground case, which is the one that made the feature feel
+broken.
+
+## Settlement and multi-exercise verification
+
+`settle_match(uuid)` (migration `20260903300000_add_match_settlement`) is the
+only thing that writes `matches.winner_id` / `matches.settled_at` or moves a
+challenge past `matched`. Before it existed, nothing did — both columns were
+dead, `challenges.status` never left `matched`, and ResultsScreen was
+unreachable because ChallengeDetail gated it on `status = 'completed'`.
+
+**Winner rules** — pushups: higher `rep_count`. plank/wallsit: higher
+`hold_duration_seconds`. race: raises; `time_seconds` is lower-is-better and
+nothing produces it yet, so it guesses nothing.
+
+**Tie rule (explicit):** nobody wins, each side is refunded exactly their own
+stake, `winner_id` stays NULL and `settled_at` IS set. A tie is a completed
+match, not an unsettled one. ResultsScreen special-cases this: reading
+`winner_id === me` alone would render a tie as "You lost".
+
+**Payout arithmetic:** both sides were already debited by `join_challenge()`,
+so the pot is `2 * stake_points` and all of it goes to the winner as one
+`payout` entry. Winner nets `+stake`, loser nets `-stake`. The loser's stake is
+never touched twice.
+
+**Anomaly gate:** if the session that *decides* the outcome is flagged and not
+yet reviewed, nothing is paid, `settled_at` stays NULL, and the challenge goes
+to `needs_review`. For a decisive result that is the winner's session only (a
+flagged loser cannot pay themselves by losing); for a tie, either side blocks.
+The gate tests `anomaly_flag AND NOT reviewed`, which is what gives
+`verification_sessions.reviewed` a purpose: a service-role reviewer sets it,
+then `settle_match()` runs again and pays out normally. There is no client
+policy on that column, by design.
+
+**Where it runs from:** inline at the end of `submit_verification_session()`,
+in the same transaction, so the match settles the instant the second result
+lands without any client involvement. A client that submits and then dies
+cannot strand a match. ResultsScreen also calls it once per mount as a safety
+net for matches predating this work. It is idempotent — the `settled_at` guard
+plus `SELECT ... FOR UPDATE` on `matches` is what makes concurrent settlement
+safe: two simultaneous submitters serialize on that row lock, and whichever
+gets it second sees both sessions.
+
+### Exercise types and the wall-sit proxy
+
+MatchInProgress drives all three scorable types from one `EXERCISES` config
+table — only the QuickPose feature string and whether the signal is *counted*
+or *timed* differ. Hold duration is accumulated by `src/lib/holdTracker.ts`
+(`QuickPoseHoldTracker`), which deliberately mirrors the SDK's
+`QuickPoseThresholdCounter` — same 0.6/0.3 hysteresis, same call style — because
+that class is a rep counter (`poseComplete(count + 1)`) and has no notion of
+elapsed time.
+
+| type | feature | mode | verified? |
+| --- | --- | --- | --- |
+| pushups | `fitness.pushUps` | reps | pre-existing |
+| plank | `fitness.plank` | hold | feature string confirmed in `parseFeature.ts` |
+| wallsit | `fitness.squats` | hold | **PROXY — see below** |
+
+**⚠️ QuickPose 0.7.1 has no wall-sit feature.** `FITNESS_EXERCISES` in
+`parseFeature.ts` lists 28 exercises and none is a wall sit, in any spelling;
+`parseFeatureString('fitness.wallSit')` returns `null`, which means the feature
+is *silently dropped* — no error, no result key, a permanent score of zero. A
+wall sit is a held bottom-of-squat, so `fitness.squats` is used as the closest
+available proxy. **This is unverified on a real device:** the squat model may
+not score a static, wall-braced hold above the 0.6 enter threshold. If it
+doesn't, swap the feature string in `EXERCISES.wallsit` (`fitness.sumoSquats`
+is the next candidate) or block wallsit the way race is blocked. Nothing else
+needs to change. `raw_metrics.source.featureIsProxy` records this on every
+wall-sit session so a reviewer is not misled about what was measured.
+
+**Alternative investigated and rejected: `rangeOfMotion.knee` / `rangeOfMotion.hip`.**
+These exist (`ROM_JOINTS` in `parseFeature.ts` includes `knee` and `hip`), so
+they were a real candidate — a wall sit is definable as "knee and hip angle
+both held near ~90°". Checked against the vendor's own docs rather than
+assumed, same as everything else in this file:
+[docs.quickpose.ai/.../Range Of Motion/Knee](https://docs.quickpose.ai/docs/MobileSDK/Features/Range%20Of%20Motion/Knee)
+and the sibling Hip page both give a `Reading: \(String(format:"%.0f°",score))`
+example — confirming the result `value` for a ROM feature is a **live angle in
+degrees**, not the 0..1 probability every `fitness.*` feature (pushups, plank,
+the squats proxy) returns. Two consequences:
+
+1. It cannot plug into `QuickPoseHoldTracker` as built. That class's
+   enter/exit hysteresis assumes "higher = more in position" (`value >
+   enterThreshold` enters, `value < exitThreshold` exits) — the right shape
+   for a probability, wrong for "is the angle inside a target band". Making
+   ROM work would mean a second, range-containment comparison, not a reuse of
+   the existing one.
+2. There is no vendor-documented target angle for anything, let alone a wall
+   sit specifically — the Hip page's only worked example is "raise your leg
+   to the side," unrelated. A threshold here would be entirely invented, with
+   no trained-model backing, versus `fitness.squats`, which is at least a real
+   classifier the vendor trained (whether it responds to a *static* wall-brace
+   hold the way it does to an active squat rep is the part still unverified).
+3. The docs' own idiom for reading a ROM value —
+   `QuickPoseDoubleUnchangedDetector`, which waits for a reading to *stabilize*
+   for ~2 seconds before accepting it — is built for "capture one peak
+   measurement" (a physio-style ROM assessment), not "sustain a position for
+   an open-ended duration." It's also Swift/Kotlin-only:
+   `grep -rn -i "unchanged" node_modules/@quickpose/react-native/{src,ios,android}`
+   finds nothing, so it isn't reachable from this RN bridge at all.
+
+Net: technically wireable, but weaker on every axis than the squats proxy
+already in place. Left as `fitness.squats` unless on-device testing rules that
+out too.
+
+Hold anomaly heuristics differ from the rep ones because the cheat differs: a
+propped-up phone aimed at a photo holds "perfect form" forever, so the flags
+are `implausiblyLongHold` (>10 min) and `fragmentedHold` (majority of segments
+under 750ms, i.e. threshold jitter banked as real time), alongside the shared
+`leftFrameTooOften` / `trackingTooPoor`.
+
+Everything the original verification note said about trust still holds: this
+verifies WHO submits, never WHAT they submit. Hold duration is accumulated
+on-device in JS exactly like rep count, so it is equally self-reported.
+
+## RLS: the participant-policy recursion bug (fixed 2026-09-04)
+
+Until migration `20260904000000_fix_participant_rls_recursion`, **every
+client read of `matches` or `match_participants` failed** with
+`infinite recursion detected in policy for relation "match_participants"`.
+Reproduced against the live database with `SET ROLE authenticated; SELECT
+count(*) FROM match_participants;` (and the same on `matches`);
+`challenges` read fine as a control.
+
+**Cause.** `match_participants_select_participant` answered "is the caller
+in this match" with an `EXISTS` subquery against `match_participants` — the
+table the policy is on. Postgres applies RLS to every table a policy
+references, so evaluating the policy re-entered itself, and the rewriter
+rejects that at plan time before it looks at any rows. The
+`user_id = auth.uid() OR ...` short-circuit is irrelevant: the failure is
+structural, not data-dependent. `matches_select_participant` subqueried into
+`match_participants` too, so it inherited the error.
+
+**Why it looked like "Accept does nothing".** Every *write* in the flow is a
+`SECURITY DEFINER` function and bypasses RLS, so `join_challenge()` happily
+created the match and flipped the challenge to `matched` — and then the app
+could never read the match it had just created. `ChallengeDetailScreen.load()`
+discarded the `matches` error, so `match` stayed null and the Go to Match
+button (gated on it) never rendered; `MatchFoundWatcher` returned silently on
+the same error, so the creator was never navigated either. Both call sites
+now surface the error (a message on ChallengeDetail, a `console.warn` in the
+watcher) so a policy regression can't hide the same way again.
+
+**Fix.** `public.is_match_participant(uuid)` — a `STABLE SECURITY DEFINER`
+SQL function — does the membership lookup as the table owner, so RLS is not
+re-applied inside it, and both policies now call it instead of subquerying.
+Postgres never inlines `SECURITY DEFINER` SQL functions, so the planner
+cannot fold it back into the recursion. Semantics are unchanged: a
+participant sees the match and every participant row in it.
+`verification_sessions_select_own` was left as-is — it references
+`match_participants`, not itself, and with that table's policy no longer
+self-referential there is no cycle left for it to fall into. Verified after
+deploy: all three tables now read cleanly as `authenticated`.
+
+**Rule going forward:** an RLS policy must never query the table it is on.
+If a policy needs "is the caller a member of X", put that lookup in a
+`SECURITY DEFINER` helper the way `is_match_participant` does.
+
 ## Migration status: applied
 
-The migration was applied 2026-09-02 via `prisma migrate deploy` against
-the live project (`bxfonvtmhxjcnmjhcsls.supabase.co`). `prisma/.env` and
-`.env` are both filled in. Verified independently afterward (introspection
-+ catalog queries, not just "the command exited 0"): `signups` and all of
-Supabase's real `auth.*` tables are untouched, all six new tables exist,
-all 9 RLS policies exist, and both `join_challenge`/`grant_starter_bonus`
-exist. `npx prisma migrate status` reports the schema up to date.
+The original migration was applied 2026-09-02 via `prisma migrate deploy`
+against the live project (`bxfonvtmhxjcnmjhcsls.supabase.co`). `prisma/.env`
+and `.env` are both filled in. Verified independently afterward
+(introspection + catalog queries, not just "the command exited 0"):
+`signups` and all of Supabase's real `auth.*` tables are untouched, all six
+new tables exist, all 9 RLS policies exist, and both
+`join_challenge`/`grant_starter_bonus` exist. `npx prisma migrate status`
+reports the schema up to date.
+
+The three later migrations (`enable_realtime`, `add_needs_review_status`,
+`add_match_settlement`) were deployed 2026-09-03, also via `migrate deploy`.
+Confirmed applied from the CLI's own output — 5 migrations found, all
+showing as successfully applied. Publication membership was later confirmed
+directly from `pg_publication_tables` on 2026-09-04 (`challenges,
+fitness_profiles`), so the realtime migration did take effect. `settle_match()`
+and `needs_review` remain unverified by independent introspection; if they
+misbehave, that (rather than a code bug) is the first thing to rule out.
+
+`20260904000000_fix_participant_rls_recursion` was deployed 2026-09-04 via
+`migrate deploy` and verified afterward by re-running the failing
+`SET ROLE authenticated` reads — see the RLS section above.
 
 The "baseline before running anything" concern this section used to lead
 with turned out to be a non-issue in practice: `migrate deploy` (unlike
@@ -243,9 +477,29 @@ machine before the CLI's engine binaries will be present.
   `@db.Uuid` columns.
 - `prisma/migrations/20260902000000_add_fittr_challenge_models/migration.sql`
   — tables, RLS policies, `join_challenge()`, `grant_starter_bonus()`.
+- `prisma/migrations/20260903100000_enable_realtime/migration.sql` — adds
+  `challenges` and `fitness_profiles` to the `supabase_realtime`
+  publication. See "Realtime" above.
+- `prisma/migrations/20260903200000_add_needs_review_status/migration.sql` —
+  one `ALTER TYPE ... ADD VALUE`, alone in its own migration on purpose.
+- `prisma/migrations/20260903300000_add_match_settlement/migration.sql` —
+  `settle_match()`, and `submit_verification_session()` extended to accept
+  hold duration. See "Settlement" above.
+- `prisma/migrations/20260904000000_fix_participant_rls_recursion/migration.sql`
+  — `is_match_participant()` and the rewritten `matches` /
+  `match_participants` SELECT policies. See "RLS: the participant-policy
+  recursion bug" above.
 - `prisma.config.ts` — points Prisma CLI at `prisma/.env`'s `DIRECT_URL`.
 - `src/lib/supabase.ts` — the only client the app runtime talks to Postgres
   through.
 - `src/types/database.ts` — hand-kept mirror of the schema in the
   snake_case shape PostgREST actually returns (not Prisma's camelCase
   client types, which the app never imports).
+- `src/components/MatchFoundWatcher.tsx` — app-level "your challenge was
+  accepted" subscriber. Mounted once inside `NavigationContainer`.
+- `src/lib/navigationRef.ts` — navigation handle for that watcher, which
+  has no `navigation` prop of its own.
+- `src/lib/holdTracker.ts` — `QuickPoseHoldTracker`, the hold-duration
+  analogue of the SDK's rep counter. Unit-tested in
+  `__tests__/holdTracker.test.ts`; it takes an injected clock precisely so it
+  can be verified without a device.
