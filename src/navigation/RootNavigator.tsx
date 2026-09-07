@@ -19,6 +19,16 @@ import { ProfileScreen } from '../screens/ProfileScreen';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
+/**
+ * Bouts / Create / Profile are tabs drawn by each screen's own TabBar, but
+ * they sit on this one native stack, so without this a tab tap played a
+ * full push/pop slide with the tab bar riding along. A tab switch should
+ * be instant, like a real tab bar, and the back-swipe should not reveal
+ * the previous tab underneath. Detail, match and results screens keep the
+ * default slide, since those really are pushed on top.
+ */
+const TAB_SCREEN = { animation: 'none', gestureEnabled: false } as const;
+
 /** Keeps the container's own ground black, so screen transitions never flash white. */
 const theme = {
   ...DarkTheme,
@@ -80,11 +90,12 @@ export function RootNavigator() {
         {session ? (
           <>
             {onboarded ? null : onboarding}
-            <Stack.Screen name="Home" component={HomeScreen} />
+            <Stack.Screen name="Home" component={HomeScreen} options={TAB_SCREEN} />
             {onboarded ? onboarding : null}
             <Stack.Screen
               name="CreateChallenge"
               component={CreateChallengeScreen}
+              options={TAB_SCREEN}
             />
             <Stack.Screen
               name="ChallengeDetail"
@@ -96,7 +107,7 @@ export function RootNavigator() {
               options={{ gestureEnabled: false }}
             />
             <Stack.Screen name="Results" component={ResultsScreen} />
-            <Stack.Screen name="Profile" component={ProfileScreen} />
+            <Stack.Screen name="Profile" component={ProfileScreen} options={TAB_SCREEN} />
           </>
         ) : (
           <Stack.Screen name="Login" component={LoginScreen} />
