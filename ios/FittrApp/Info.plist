@@ -28,6 +28,10 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Fittr uses the camera to count and verify your reps during a challenge.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Fittr uses your photo library to set your profile picture.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Fittr uses Face ID to unlock the app when biometric login is on.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

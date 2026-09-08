@@ -88,30 +88,123 @@ model FitnessProfile {
   userId        String       @unique @map("user_id") @db.Uuid
   strengthTier  StrengthTier @default(beginner) @map("strength_tier")
   pointsBalance Int          @default(0) @map("points_balance")
+  /// Settings > Profile. Free-form, up to 40 characters.
+  displayName   String?      @map("display_name")
+  /// Unique, case-insensitive (citext), ^[a-z0-9][a-z0-9._]{2,19}$. Set by
+  /// update_my_profile(); backfilled from the sign-up handle.
+  username      String?      @unique @db.Citext
+  /// Public URL in the `avatars` storage bucket.
+  avatarUrl     String?      @map("avatar_url")
   createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   @@map("fitness_profiles")
 }
 
+/// Settings > Notifications. One row per user, created on first change.
+model UserSettings {
+  userId        String   @id @map("user_id") @db.Uuid
+  notifications Json     @default("{\"callouts\": true, \"results\": true, \"reminders\": true}")
+  updatedAt     DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("user_settings")
+}
+
+/// Settings > Active sessions. Devices that have opened the app with this
+/// account; upserted on launch (src/lib/device.ts).
+model UserDevice {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  deviceId   String   @map("device_id")
+  name       String
+  platform   String
+  appVersion String?  @map("app_version")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+  @@map("user_devices")
+}
+
+/// While `open` a Challenge is a forming lobby that matchmaking_queue rows
+/// point at; once `matched` it is the header of a Match. Nobody browses or
+/// inserts these from the client any more: enter_matchmaking() opens them.
 model Challenge {
   id          String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   type        ChallengeType
   format      ChallengeFormat
   stakePoints Int             @map("stake_points")
+  /// Seats: 2 for 1v1 (enforced by a CHECK), 3..6 for a Group Battle.
+  maxParticipants Int         @default(2) @map("max_participants")
   status      ChallengeStatus @default(open)
   createdById String          @map("created_by") @db.Uuid
   createdAt   DateTime        @default(now()) @map("created_at")
 
-  match Match?
+  match        Match?
+  queueEntries MatchmakingQueueEntry[]
 
   @@index([status])
   @@index([type])
   @@map("challenges")
 }
 
-/// One Match per Challenge. Created by the join_challenge() DB function once
-/// a second, tier-matching participant accepts — see BACKEND.md for why
-/// matchmaking runs as a single SQL function instead of client-side writes.
+enum MatchmakingStatus {
+  searching
+  matched
+  cancelled
+}
+
+/// One row per fighter in the live queue. Written only by enter_matchmaking(),
+/// matchmaking_heartbeat() and leave_matchmaking() (SECURITY DEFINER); readable
+/// by its owner, which is also the Searching screen's realtime channel. The
+/// hand-written migration adds a partial unique index (user_id WHERE status =
+/// 'searching') that Prisma cannot express — see BACKEND.md, "Live matchmaking".
+model MatchmakingQueueEntry {
+  id              String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId          String            @map("user_id") @db.Uuid
+  exerciseType    ChallengeType     @map("exercise_type")
+  format          ChallengeFormat
+  maxParticipants Int               @map("max_participants")
+  stakePoints     Int               @map("stake_points")
+  /// Tier at the moment of entry.
+  strengthTier    StrengthTier      @map("strength_tier")
+  status          MatchmakingStatus @default(searching)
+  /// The lobby this entry is provisionally seated in.
+  challengeId     String?           @map("challenge_id") @db.Uuid
+  challenge       Challenge?        @relation(fields: [challengeId], references: [id], onDelete: SetNull)
+  /// Set in the same transaction that creates the Match.
+  matchId         String?           @map("match_id") @db.Uuid
+  match           Match?            @relation(fields: [matchId], references: [id], onDelete: SetNull)
+  /// Searching members in the lobby, pushed to every member's own row.
+  lobbySize       Int               @default(1) @map("lobby_size")
+  /// 'expired' | 'insufficient_points' | 'replaced'; null otherwise.
+  cancelReason    String?           @map("cancel_reason")
+  joinedAt        DateTime          @default(now()) @map("joined_at") @db.Timestamptz(6)
+  /// When the row left `searching` (matched or cancelled). Drives retention.
+  closedAt        DateTime?         @map("closed_at") @db.Timestamptz(6)
+
+  presence MatchmakingPresence?
+
+  @@index([exerciseType, format, maxParticipants, status])
+  @@index([challengeId])
+  @@map("matchmaking_queue")
+}
+
+/// Heartbeat timestamps, one per live queue entry. Kept off the published
+/// table so a beat every 5 s is not a realtime event. Not client-readable.
+model MatchmakingPresence {
+  queueId    String                @id @map("queue_id") @db.Uuid
+  entry      MatchmakingQueueEntry @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  lastSeenAt DateTime              @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+
+  @@map("matchmaking_presence")
+}
+
+/// One Match per Challenge. Created by _mm_try_complete() inside
+/// enter_matchmaking() / matchmaking_heartbeat() the instant a lobby fills —
+/// see BACKEND.md for why matchmaking runs as SQL functions instead of
+/// client-side writes.
 model Match {
   id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   challengeId String    @unique @map("challenge_id") @db.Uuid
@@ -122,6 +215,7 @@ model Match {
 
   participants  MatchParticipant[]
   ledgerEntries PointsLedgerEntry[]
+  queueEntries  MatchmakingQueueEntry[]
 
   @@map("matches")
 }

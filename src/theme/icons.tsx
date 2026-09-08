@@ -26,7 +26,24 @@ export type IconName =
   | 'timer'
   | 'wall'
   | 'run'
-  | 'clock';
+  | 'clock'
+  // Settings
+  | 'caret-right'
+  | 'lock'
+  | 'shield'
+  | 'scan'
+  | 'link'
+  | 'devices'
+  | 'card'
+  | 'wallet'
+  | 'bell'
+  | 'crown'
+  | 'list'
+  | 'trash'
+  | 'key'
+  | 'image'
+  | 'mail'
+  | 'logout';
 
 interface IconProps {
   name: IconName;
@@ -440,6 +457,295 @@ export function Icon({
         </>
       );
       break;
+
+    // ── Settings ──────────────────────────────────────────────────────
+
+    case 'caret-right':
+      body = <View style={chevron(s * 0.4, { left: s * 0.18, ...rot(135) })} />;
+      break;
+    case 'lock': {
+      const body_: ViewStyle = {
+        position: 'absolute',
+        bottom: 0,
+        width: s * 0.76,
+        height: s * 0.52,
+        borderRadius: t * 1.4,
+        backgroundColor: color,
+      };
+      const shackle: ViewStyle = {
+        position: 'absolute',
+        top: s * 0.02,
+        width: s * 0.46,
+        height: s * 0.5,
+        borderWidth: t,
+        borderColor: color,
+        borderBottomWidth: 0,
+        borderTopLeftRadius: s * 0.23,
+        borderTopRightRadius: s * 0.23,
+      };
+      body = (
+        <>
+          <View style={shackle} />
+          <View style={body_} />
+          <View style={disc(t * 1.2, { bottom: s * 0.2, backgroundColor: contrast })} />
+        </>
+      );
+      break;
+    }
+    case 'shield': {
+      const outline: ViewStyle = {
+        position: 'absolute',
+        width: s * 0.74,
+        height: s * 0.9,
+        borderWidth: t,
+        borderColor: color,
+        borderTopLeftRadius: t * 1.5,
+        borderTopRightRadius: t * 1.5,
+        borderBottomLeftRadius: s * 0.37,
+        borderBottomRightRadius: s * 0.37,
+      };
+      const tick: ViewStyle = {
+        width: s * 0.34,
+        height: s * 0.18,
+        borderLeftWidth: t,
+        borderBottomWidth: t,
+        borderColor: color,
+        marginTop: -s * 0.1,
+        ...rot(-45),
+      };
+      body = (
+        <>
+          <View style={outline} />
+          <View style={tick} />
+        </>
+      );
+      break;
+    }
+    case 'scan': {
+      const corner = (extra: ViewStyle) => chevron(s * 0.26, extra);
+      const smile: ViewStyle = {
+        position: 'absolute',
+        bottom: s * 0.28,
+        width: s * 0.34,
+        height: s * 0.16,
+        borderBottomWidth: t,
+        borderColor: color,
+        borderBottomLeftRadius: s * 0.17,
+        borderBottomRightRadius: s * 0.17,
+      };
+      body = (
+        <>
+          <View style={corner({ top: 0, left: 0 })} />
+          <View style={corner({ top: 0, right: 0, ...rot(90) })} />
+          <View style={corner({ bottom: 0, right: 0, ...rot(180) })} />
+          <View style={corner({ bottom: 0, left: 0, ...rot(270) })} />
+          <View style={disc(t * 1.1, { top: s * 0.34, left: s * 0.32 })} />
+          <View style={disc(t * 1.1, { top: s * 0.34, right: s * 0.32 })} />
+          <View style={smile} />
+        </>
+      );
+      break;
+    }
+    case 'link':
+      body = (
+        <>
+          <View style={ring(s * 0.54, { left: 0, top: s * 0.23 })} />
+          <View style={ring(s * 0.54, { right: 0, top: s * 0.23 })} />
+          <View style={bar(s * 0.3, t)} />
+        </>
+      );
+      break;
+    case 'devices': {
+      const phone: ViewStyle = {
+        position: 'absolute',
+        width: s * 0.58,
+        height: s * 0.96,
+        borderRadius: t * 2,
+        borderWidth: t,
+        borderColor: color,
+      };
+      body = (
+        <>
+          <View style={phone} />
+          <View style={bar(s * 0.2, t, { bottom: s * 0.14 })} />
+        </>
+      );
+      break;
+    }
+    case 'card': {
+      const plate: ViewStyle = {
+        position: 'absolute',
+        width: s,
+        height: s * 0.68,
+        borderRadius: t * 1.6,
+        borderWidth: t,
+        borderColor: color,
+      };
+      body = (
+        <>
+          <View style={plate} />
+          <View style={bar(s, t * 1.2, { top: s * 0.32, borderRadius: 0 })} />
+          <View style={bar(s * 0.28, t, { bottom: s * 0.26, left: s * 0.14 })} />
+        </>
+      );
+      break;
+    }
+    case 'wallet': {
+      const fold: ViewStyle = {
+        position: 'absolute',
+        width: s * 0.96,
+        height: s * 0.72,
+        borderRadius: t * 1.6,
+        borderWidth: t,
+        borderColor: color,
+      };
+      body = (
+        <>
+          <View style={fold} />
+          <View
+            style={bar(s * 0.34, s * 0.26, {
+              right: 0,
+              borderRadius: t,
+              borderTopLeftRadius: s * 0.13,
+              borderBottomLeftRadius: s * 0.13,
+            })}
+          />
+          <View style={disc(t * 1.2, { right: s * 0.12, backgroundColor: contrast })} />
+        </>
+      );
+      break;
+    }
+    case 'bell': {
+      const dome: ViewStyle = {
+        position: 'absolute',
+        top: s * 0.06,
+        width: s * 0.62,
+        height: s * 0.58,
+        borderWidth: t,
+        borderBottomWidth: 0,
+        borderColor: color,
+        borderTopLeftRadius: s * 0.31,
+        borderTopRightRadius: s * 0.31,
+      };
+      body = (
+        <>
+          <View style={dome} />
+          <View style={bar(s * 0.86, t, { top: s * 0.62 })} />
+          <View style={bar(s * 0.24, t * 1.2, { bottom: s * 0.06 })} />
+          <View style={bar(t, s * 0.14, { top: 0 })} />
+        </>
+      );
+      break;
+    }
+    case 'crown':
+      body = (
+        <>
+          <View style={bar(s * 0.9, t * 1.5, { bottom: s * 0.08, borderRadius: 1 })} />
+          <View style={bar(t * 1.5, s * 0.5, { bottom: s * 0.08, left: s * 0.05, borderRadius: 1 })} />
+          <View style={bar(t * 1.5, s * 0.7, { bottom: s * 0.08, borderRadius: 1 })} />
+          <View style={bar(t * 1.5, s * 0.5, { bottom: s * 0.08, right: s * 0.05, borderRadius: 1 })} />
+          <View style={disc(t * 1.8, { top: s * 0.36, left: s * 0.02 })} />
+          <View style={disc(t * 1.8, { top: s * 0.16 })} />
+          <View style={disc(t * 1.8, { top: s * 0.36, right: s * 0.02 })} />
+        </>
+      );
+      break;
+    case 'list':
+      body = (
+        <>
+          <View style={bar(s * 0.84, t, { top: s * 0.18 })} />
+          <View style={bar(s * 0.84, t)} />
+          <View style={bar(s * 0.84, t, { bottom: s * 0.18 })} />
+        </>
+      );
+      break;
+    case 'trash': {
+      const bin: ViewStyle = {
+        position: 'absolute',
+        bottom: 0,
+        width: s * 0.64,
+        height: s * 0.66,
+        borderWidth: t,
+        borderTopWidth: 0,
+        borderColor: color,
+        borderBottomLeftRadius: t * 1.4,
+        borderBottomRightRadius: t * 1.4,
+      };
+      body = (
+        <>
+          <View style={bin} />
+          <View style={bar(s * 0.88, t, { top: s * 0.2 })} />
+          <View style={bar(s * 0.3, t, { top: s * 0.06 })} />
+        </>
+      );
+      break;
+    }
+    case 'key':
+      body = (
+        <>
+          <View style={ring(s * 0.46, { left: 0, top: s * 0.27 })} />
+          <View style={bar(s * 0.52, t, { right: 0 })} />
+          <View style={bar(t, s * 0.22, { right: s * 0.04, top: s * 0.5 })} />
+          <View style={bar(t, s * 0.16, { right: s * 0.2, top: s * 0.5 })} />
+        </>
+      );
+      break;
+    case 'image': {
+      const frame: ViewStyle = {
+        position: 'absolute',
+        width: s,
+        height: s * 0.82,
+        borderRadius: t * 1.6,
+        borderWidth: t,
+        borderColor: color,
+      };
+      body = (
+        <>
+          <View style={frame} />
+          <View style={disc(t * 1.6, { top: s * 0.24, left: s * 0.24 })} />
+          <View style={bar(s * 0.5, t, { bottom: s * 0.26, right: s * 0.12, ...rot(-35) })} />
+        </>
+      );
+      break;
+    }
+    case 'mail': {
+      const envelope: ViewStyle = {
+        position: 'absolute',
+        width: s,
+        height: s * 0.7,
+        borderRadius: t * 1.4,
+        borderWidth: t,
+        borderColor: color,
+      };
+      body = (
+        <>
+          <View style={envelope} />
+          <View style={chevron(s * 0.42, { top: s * 0.14, ...rot(225) })} />
+        </>
+      );
+      break;
+    }
+    case 'logout': {
+      const door: ViewStyle = {
+        position: 'absolute',
+        left: 0,
+        width: s * 0.56,
+        height: s * 0.92,
+        borderWidth: t,
+        borderRightWidth: 0,
+        borderColor: color,
+        borderTopLeftRadius: t * 1.4,
+        borderBottomLeftRadius: t * 1.4,
+      };
+      body = (
+        <>
+          <View style={door} />
+          <View style={bar(s * 0.5, t, { right: 0 })} />
+          <View style={chevron(s * 0.32, { right: s * 0.02, ...rot(135) })} />
+        </>
+      );
+      break;
+    }
   }
 
   return (

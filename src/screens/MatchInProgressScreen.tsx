@@ -19,7 +19,7 @@ import {
 import { QUICKPOSE_SDK_KEY } from '@env';
 import { supabase } from '../lib/supabase';
 import { QuickPoseHoldTracker } from '../lib/holdTracker';
-import { formatScore, scoreFor } from '../lib/boutStats';
+import { formatScore, scoreFor, sortByScore } from '../lib/boutStats';
 import { formatSeconds } from '../lib/format';
 import { initialsOf, peerHandle } from '../lib/identity';
 import { useAuth } from '../context/AuthContext';
@@ -151,6 +151,9 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [challengeType, setChallengeType] = useState<ChallengeType | null>(null);
+  // challenges.max_participants: 2 is a 1v1, 3..6 a Group Battle. Decides
+  // whether the strip names one opponent or summarises the field.
+  const [seats, setSeats] = useState(2);
   const [participants, setParticipants] = useState<MatchParticipantRow[]>([]);
   const [participantId, setParticipantId] = useState<string | null>(null);
   const [hasCameraPermission, setHasCameraPermission] = useState(false);
@@ -229,7 +232,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
         await Promise.all([
           supabase
             .from('challenges')
-            .select('id, type')
+            .select('id, type, max_participants')
             .eq('id', matchData.challenge_id)
             .single(),
           supabase
@@ -243,6 +246,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
       }
 
       setChallengeType((challengeData?.type as ChallengeType) ?? null);
+      setSeats(challengeData?.max_participants ?? 2);
       const rows = (participantData ?? []) as MatchParticipantRow[];
       setParticipants(rows);
 
@@ -548,12 +552,12 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
             {unit}
           </Label>
           <Body muted style={styles.doneNote}>
-            The decision lands the moment both results are in. Points move on
+            The decision lands the moment every result is in. Points move on
             their own.
           </Body>
         </View>
         {/* Results handles every state, including "still waiting on the
-            other participant", so it is safe to offer immediately. */}
+            rest of the field", so it is safe to offer immediately. */}
         <Dock>
           <Button
             label="SEE THE DECISION"
@@ -609,10 +613,22 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   }
 
   const me = session?.user.id ?? null;
-  const opponent = participants.find(p => p.user_id !== me) ?? null;
+  const opponents = participants.filter(p => p.user_id !== me);
+  // 1v1: the one opponent, by name.
+  const opponent = opponents[0] ?? null;
   const opponentScore =
     opponent && challengeType ? scoreFor(opponent, challengeType) : null;
   const opponentHandle = opponent ? peerHandle(opponent.user_id) : null;
+  // Group: the field as a whole. Five avatars don't fit in one glass strip,
+  // and the only number that matters mid-round is the score to beat.
+  const fieldScores = challengeType
+    ? sortByScore(
+        opponents.map(p => ({ score: scoreFor(p, challengeType) })),
+        challengeType,
+      )
+    : [];
+  const inCount = fieldScores.filter(o => o.score !== null).length;
+  const bestInField = fieldScores[0]?.score ?? null;
 
   let formMessage: string;
   if (!running) {
@@ -666,7 +682,24 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
         </View>
       </View>
 
-      {opponentHandle ? (
+      {seats > 2 ? (
+        <View style={[styles.strip, stripPad]} pointerEvents="none">
+          <View style={styles.stripField}>
+            <Label size={10} tracking={0.12}>
+              THE FIELD
+            </Label>
+            <Text style={styles.stripHandle}>{`${inCount} of ${seats - 1} in`}</Text>
+          </View>
+          <View style={styles.stripRight}>
+            <Numeral size={28}>
+              {challengeType ? formatScore(bestInField, challengeType) : '—'}
+            </Numeral>
+            <Label size={10} tracking={0.12}>
+              {bestInField === null ? 'NOBODY IN YET' : unit}
+            </Label>
+          </View>
+        </View>
+      ) : opponentHandle ? (
         <View style={[styles.strip, stripPad]} pointerEvents="none">
           <View style={styles.stripLeft}>
             <Avatar initials={initialsOf(opponentHandle)} size={28} />
@@ -835,6 +868,8 @@ const styles = StyleSheet.create({
     backgroundColor: colors.glass,
   },
   stripLeft: { flexDirection: 'row', alignItems: 'center', gap: space.sm + 2 },
+  /** Label over count, same footprint as the avatar row. */
+  stripField: { justifyContent: 'center', gap: 2 },
   stripHandle: { ...label(12, colors.secondary, 0), textTransform: 'none' },
   stripRight: { flexDirection: 'row', alignItems: 'baseline', gap: 6 },
 

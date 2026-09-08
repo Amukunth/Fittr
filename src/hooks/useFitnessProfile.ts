@@ -8,26 +8,14 @@ interface UseFitnessProfileResult {
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
-  /**
-   * Adopt an already-complete row without refetching. Deliberately not
-   * `refresh()`: that flips `loading` back to true, and consumers gate a
-   * full-screen spinner on it, so using it for a live balance tick would
-   * flash the whole screen on every stake.
-   */
-  applyRow: (row: FitnessProfileRow) => void;
 }
 
 /**
- * Fetches the current user's FitnessProfile, creating one (with a one-time
- * starter bonus — see grant_starter_bonus in the migration) the first time
- * they ever log in, and keeps points_balance live afterwards.
- *
- * The live part matters on every screen that prints the balance (the Home
- * pill, Create's "YOU HAVE", Profile): join_challenge() deducts BOTH users'
- * stakes, so a creator's balance goes stale the instant someone accepts,
- * and settle_match() pays out with no client involved. Filtered to this
- * user's own row server-side, which fitness_profiles_select_own enforces
- * anyway.
+ * Fetches the current user's FitnessProfile (tier, points, identity),
+ * creating one and granting the starter bonus the first time they log in.
+ * Kept live by realtime on the row: join_challenge() / settle_match() move
+ * points_balance from the other player's device, and Settings edits the
+ * identity columns through update_my_profile().
  */
 export function useFitnessProfile(): UseFitnessProfileResult {
   const { session } = useAuth();
@@ -44,7 +32,6 @@ export function useFitnessProfile(): UseFitnessProfileResult {
       return;
     }
 
-    setLoading(true);
     setError(null);
 
     const { data: existing, error: selectError } = await supabase
@@ -67,7 +54,7 @@ export function useFitnessProfile(): UseFitnessProfileResult {
 
     const { data: created, error: insertError } = await supabase
       .from('fitness_profiles')
-      .insert({ user_id: userId, strength_tier: 'beginner' })
+      .insert({ user_id: userId, strength_tier: 'beginner', points_balance: 0 })
       .select('*')
       .single();
 
@@ -77,33 +64,25 @@ export function useFitnessProfile(): UseFitnessProfileResult {
       return;
     }
 
+    // One-time 500 point opening purse. Idempotent server-side.
     const { error: bonusError } = await supabase.rpc('grant_starter_bonus', {
       p_user_id: userId,
     });
     if (bonusError) {
       setError(bonusError.message);
+      setProfile(created as FitnessProfileRow);
       setLoading(false);
       return;
     }
 
-    const { data: withBonus, error: refetchError } = await supabase
+    const { data: refreshed } = await supabase
       .from('fitness_profiles')
       .select('*')
       .eq('user_id', userId)
-      .single();
-
-    if (refetchError) {
-      setError(refetchError.message);
-      setProfile(created as FitnessProfileRow);
-    } else {
-      setProfile(withBonus as FitnessProfileRow);
-    }
+      .maybeSingle();
+    setProfile((refreshed ?? created) as FitnessProfileRow);
     setLoading(false);
   }, [userId]);
-
-  const applyRow = useCallback((row: FitnessProfileRow) => {
-    setProfile(row);
-  }, []);
 
   useEffect(() => {
     load();
@@ -114,7 +93,7 @@ export function useFitnessProfile(): UseFitnessProfileResult {
       return;
     }
     const channel = supabase
-      .channel(channelName(`fitness-profile:${userId}`))
+      .channel(channelName(`profile:${userId}`))
       .on(
         'postgres_changes',
         {
@@ -124,8 +103,7 @@ export function useFitnessProfile(): UseFitnessProfileResult {
           filter: `user_id=eq.${userId}`,
         },
         payload => {
-          // payload.new is the complete new row, so no refetch is needed.
-          applyRow(payload.new as FitnessProfileRow);
+          setProfile(payload.new as FitnessProfileRow);
         },
       )
       .subscribe();
@@ -133,7 +111,7 @@ export function useFitnessProfile(): UseFitnessProfileResult {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [userId, applyRow]);
+  }, [userId]);
 
-  return { profile, loading, error, refresh: load, applyRow };
+  return { profile, loading, error, refresh: load };
 }

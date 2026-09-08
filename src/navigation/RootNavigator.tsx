@@ -2,30 +2,37 @@ import React, { useEffect, useState } from 'react';
 import { DarkTheme, NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useAuth } from '../context/AuthContext';
-import { navigationRef } from '../lib/navigationRef';
 import { hasOnboarded } from '../lib/onboarding';
-import { MatchFoundWatcher } from '../components/MatchFoundWatcher';
 import { colors } from '../theme/tokens';
 import { Loading } from '../theme/ui';
 import type { RootStackParamList } from './types';
 import { LoginScreen } from '../screens/LoginScreen';
 import { OnboardingScreen } from '../screens/OnboardingScreen';
 import { HomeScreen } from '../screens/HomeScreen';
-import { CreateChallengeScreen } from '../screens/CreateChallengeScreen';
-import { ChallengeDetailScreen } from '../screens/ChallengeDetailScreen';
+import { FindBoutScreen } from '../screens/FindBoutScreen';
+import { SearchingScreen } from '../screens/SearchingScreen';
 import { MatchInProgressScreen } from '../screens/MatchInProgressScreen';
 import { ResultsScreen } from '../screens/ResultsScreen';
 import { ProfileScreen } from '../screens/ProfileScreen';
+import { SettingsScreen } from '../screens/settings/SettingsScreen';
+import { ChangePasswordScreen } from '../screens/settings/ChangePasswordScreen';
+import { TwoFactorScreen } from '../screens/settings/TwoFactorScreen';
+import { SessionsScreen } from '../screens/settings/SessionsScreen';
+import { ConnectedAccountsScreen } from '../screens/settings/ConnectedAccountsScreen';
+import { DepositScreen } from '../screens/settings/DepositScreen';
+import { CashoutScreen } from '../screens/settings/CashoutScreen';
+import { LinkedAccountsScreen } from '../screens/settings/LinkedAccountsScreen';
+import { TransactionsScreen } from '../screens/settings/TransactionsScreen';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 /**
- * Bouts / Create / Profile are tabs drawn by each screen's own TabBar, but
+ * Bouts / Find / Profile are tabs drawn by each screen's own TabBar, but
  * they sit on this one native stack, so without this a tab tap played a
  * full push/pop slide with the tab bar riding along. A tab switch should
  * be instant, like a real tab bar, and the back-swipe should not reveal
- * the previous tab underneath. Detail, match and results screens keep the
- * default slide, since those really are pushed on top.
+ * the previous tab underneath. Searching, match and results screens keep
+ * the default slide, since those really are pushed on top.
  */
 const TAB_SCREEN = { animation: 'none', gestureEnabled: false } as const;
 
@@ -43,7 +50,7 @@ const theme = {
 };
 
 export function RootNavigator() {
-  const { session, loading } = useAuth();
+  const { session, loading, mfaRequired } = useAuth();
   const userId = session?.user.id ?? null;
 
   // null while the per-user flag is being read; the signed-in stack is not
@@ -79,27 +86,35 @@ export function RootNavigator() {
     <Stack.Screen name="Onboarding" component={OnboardingScreen} />
   );
 
+  // A session that still owes a two-factor code stays on Login, which
+  // shows the code step; nothing signed-in is reachable until it clears.
+  const signedIn = Boolean(session) && !mfaRequired;
+
   return (
-    <NavigationContainer ref={navigationRef} theme={theme}>
+    <NavigationContainer theme={theme}>
       <Stack.Navigator
         screenOptions={{
           headerShown: false,
           contentStyle: { backgroundColor: colors.bg },
         }}
       >
-        {session ? (
+        {signedIn ? (
           <>
             {onboarded ? null : onboarding}
             <Stack.Screen name="Home" component={HomeScreen} options={TAB_SCREEN} />
             {onboarded ? onboarding : null}
+            <Stack.Screen name="FindBout" component={FindBoutScreen} options={TAB_SCREEN} />
+            {/*
+              No back-swipe: leaving the queue has to go through the screen's
+              own cancel path (it must learn whether the lobby filled in the
+              same instant), which it does by intercepting beforeRemove. A
+              gesture that starts the pop before the RPC answers would
+              defeat that.
+            */}
             <Stack.Screen
-              name="CreateChallenge"
-              component={CreateChallengeScreen}
-              options={TAB_SCREEN}
-            />
-            <Stack.Screen
-              name="ChallengeDetail"
-              component={ChallengeDetailScreen}
+              name="Searching"
+              component={SearchingScreen}
+              options={{ gestureEnabled: false }}
             />
             <Stack.Screen
               name="MatchInProgress"
@@ -108,17 +123,20 @@ export function RootNavigator() {
             />
             <Stack.Screen name="Results" component={ResultsScreen} />
             <Stack.Screen name="Profile" component={ProfileScreen} options={TAB_SCREEN} />
+            <Stack.Screen name="Settings" component={SettingsScreen} />
+            <Stack.Screen name="ChangePassword" component={ChangePasswordScreen} />
+            <Stack.Screen name="TwoFactor" component={TwoFactorScreen} />
+            <Stack.Screen name="Sessions" component={SessionsScreen} />
+            <Stack.Screen name="ConnectedAccounts" component={ConnectedAccountsScreen} />
+            <Stack.Screen name="Deposit" component={DepositScreen} />
+            <Stack.Screen name="Cashout" component={CashoutScreen} />
+            <Stack.Screen name="LinkedAccounts" component={LinkedAccountsScreen} />
+            <Stack.Screen name="Transactions" component={TransactionsScreen} />
           </>
         ) : (
           <Stack.Screen name="Login" component={LoginScreen} />
         )}
       </Stack.Navigator>
-      {/*
-        Sibling of the navigator, not a screen: it has to keep listening for
-        "your challenge was accepted" no matter which screen is mounted, and
-        its banner overlays whatever is on top.
-      */}
-      <MatchFoundWatcher />
     </NavigationContainer>
   );
 }

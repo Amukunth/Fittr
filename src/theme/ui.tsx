@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Animated,
   Easing,
+  Image,
   Pressable,
   StyleSheet,
   Text,
@@ -446,11 +447,14 @@ const AVATAR_TONE = {
 
 export function Avatar({
   initials,
+  uri,
   size = 26,
   tone = 'raised',
   style,
 }: Styled<ViewStyle> & {
   initials: string;
+  /** A profile photo. Falls back to the initials while it loads or if absent. */
+  uri?: string | null;
   size?: number;
   tone?: keyof typeof AVATAR_TONE;
 }) {
@@ -463,6 +467,7 @@ export function Avatar({
     borderWidth: tone === 'empty' ? 2 : 0,
     borderStyle: tone === 'empty' ? 'dashed' : 'solid',
     borderColor: colors.slot,
+    overflow: 'hidden',
   };
   const text: TextStyle = {
     fontFamily: fonts.semibold,
@@ -473,7 +478,154 @@ export function Avatar({
   return (
     <View style={[styles.avatar, dyn, style]}>
       <Text style={text}>{initials}</Text>
+      {uri ? (
+        <Image
+          source={{ uri }}
+          style={StyleSheet.absoluteFill}
+          accessibilityIgnoresInvertColors
+        />
+      ) : null}
     </View>
+  );
+}
+
+// ── Settings rows ───────────────────────────────────────────────────────
+
+/** Section label above a group: Inter 600 10px caps, 4px in from the gutter. */
+export function SectionHead({
+  children,
+  right,
+  style,
+}: Children & Styled<ViewStyle> & { right?: React.ReactNode }) {
+  return (
+    <View style={[styles.sectionHead, style]}>
+      <Label>{children}</Label>
+      {right}
+    </View>
+  );
+}
+
+/** Card that stacks rows with a hairline between each. */
+export function RowGroup({ children, style }: Children & Styled<ViewStyle>) {
+  const rows = React.Children.toArray(children).filter(Boolean);
+  return (
+    <View style={[styles.rowGroup, style]}>
+      {rows.map((row, i) => (
+        <React.Fragment key={i}>
+          {i > 0 ? <Divider /> : null}
+          {row}
+        </React.Fragment>
+      ))}
+    </View>
+  );
+}
+
+/**
+ * One settings row: optional leading icon, title over a subtitle, and on
+ * the right either a value, a custom control (toggle, pill) or a caret when
+ * the row navigates.
+ */
+export function SettingsRow({
+  icon,
+  title,
+  subtitle,
+  value,
+  right,
+  onPress,
+  disabled,
+  tone = 'default',
+  style,
+}: Styled<ViewStyle> & {
+  icon?: IconName;
+  title: string;
+  subtitle?: string;
+  value?: string;
+  right?: React.ReactNode;
+  onPress?: () => void;
+  disabled?: boolean;
+  tone?: 'default' | 'accent' | 'destructive';
+}) {
+  const titleColor =
+    tone === 'accent' ? colors.accent : tone === 'destructive' ? colors.secondary : colors.text;
+  const titleStyle: TextStyle = { ...typography.rowTitle, color: disabled ? colors.dim : titleColor };
+  const trailing =
+    right ??
+    (value ? (
+      <Text style={styles.rowValue}>{value}</Text>
+    ) : onPress ? (
+      <Icon name="caret-right" size={16} color={colors.dim} />
+    ) : null);
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={!onPress || disabled}
+      accessibilityRole={onPress ? 'button' : undefined}
+      accessibilityState={{ disabled: Boolean(disabled) }}
+      style={({ pressed }) => [styles.row, pressed && onPress && styles.rowPressed, style]}
+    >
+      {icon ? (
+        <View style={styles.rowIcon}>
+          <Icon name={icon} size={20} color={disabled ? colors.dim : colors.secondary} />
+        </View>
+      ) : null}
+      <View style={styles.rowText}>
+        <Text style={titleStyle} numberOfLines={1}>
+          {title}
+        </Text>
+        {subtitle ? (
+          <Text style={styles.rowSubtitle} numberOfLines={2}>
+            {subtitle}
+          </Text>
+        ) : null}
+      </View>
+      {trailing}
+    </Pressable>
+  );
+}
+
+const TOGGLE_TRAVEL = 18;
+
+/** 46×28 switch: lime track with a black knob when on, raised with a grey knob when off. */
+export function Toggle({
+  value,
+  onValueChange,
+  disabled,
+  accessibilityLabel,
+}: {
+  value: boolean;
+  onValueChange: (next: boolean) => void;
+  disabled?: boolean;
+  accessibilityLabel?: string;
+}) {
+  const shift = useRef(new Animated.Value(value ? TOGGLE_TRAVEL : 0)).current;
+  useEffect(() => {
+    Animated.timing(shift, {
+      toValue: value ? TOGGLE_TRAVEL : 0,
+      duration: 160,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: true,
+    }).start();
+  }, [value, shift]);
+  const track: ViewStyle = {
+    backgroundColor: value ? colors.accent : colors.raised,
+    opacity: disabled ? 0.5 : 1,
+  };
+  const knob = {
+    backgroundColor: value ? colors.onAccent : colors.secondary,
+    transform: [{ translateX: shift }],
+  };
+  return (
+    <Pressable
+      onPress={() => onValueChange(!value)}
+      disabled={disabled}
+      accessibilityRole="switch"
+      accessibilityState={{ checked: value, disabled: Boolean(disabled) }}
+      accessibilityLabel={accessibilityLabel}
+      hitSlop={8}
+      style={[styles.toggle, track]}
+    >
+      <Animated.View style={[styles.toggleKnob, knob]} />
+    </Pressable>
   );
 }
 
@@ -783,4 +935,49 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   emptyRingText: { ...anton(40, { color: colors.slot }) },
+
+  sectionHead: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    paddingHorizontal: space.xs,
+    paddingBottom: 10,
+  },
+  rowGroup: {
+    backgroundColor: colors.card,
+    borderRadius: radius.card,
+    overflow: 'hidden',
+  },
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.md,
+    paddingVertical: 14,
+    paddingHorizontal: space.lg,
+    minHeight: sizes.circle + space.md,
+  },
+  rowPressed: { backgroundColor: colors.cardPressed },
+  rowIcon: { width: 24, alignItems: 'center' },
+  rowText: { flex: 1, minWidth: 0 },
+  rowSubtitle: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    lineHeight: 16,
+    color: colors.secondary,
+    marginTop: 3,
+  },
+  rowValue: {
+    fontFamily: fonts.medium,
+    fontSize: 13,
+    color: colors.secondary,
+    includeFontPadding: false,
+  },
+  toggle: {
+    width: 46,
+    height: 28,
+    borderRadius: radius.pill,
+    padding: 3,
+    justifyContent: 'center',
+  },
+  toggleKnob: { width: 22, height: 22, borderRadius: 11 },
 });

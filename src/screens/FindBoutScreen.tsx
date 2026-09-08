@@ -1,8 +1,6 @@
 import React, { useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { supabase } from '../lib/supabase';
-import { useAuth } from '../context/AuthContext';
 import { useFitnessProfile } from '../hooks/useFitnessProfile';
 import { compactPoints, fmtPoints } from '../lib/format';
 import type { RootStackParamList } from '../navigation/types';
@@ -11,9 +9,9 @@ import { TabBar } from '../components/TabBar';
 import {
   EXERCISE_ICON,
   EXERCISE_LABEL,
-  FORMAT_LABEL,
+  FORMAT_NAME,
   FORMAT_NOTE,
-  SEATS,
+  GROUP_SIZES,
   STAKE_OPTIONS,
   UNIT,
   VERIFIABLE_TYPES,
@@ -24,67 +22,62 @@ import {
   Button,
   Display,
   Dock,
+  IconCircle,
   Label,
   Notice,
   Numeral,
   PageHead,
 } from '../theme/ui';
 
-type Props = NativeStackScreenProps<RootStackParamList, 'CreateChallenge'>;
+type Props = NativeStackScreenProps<RootStackParamList, 'FindBout'>;
 
 const TYPES: ChallengeType[] = ['pushups', 'plank', 'wallsit', 'race'];
 const FORMATS: ChallengeFormat[] = ['1v1', 'pooled'];
-const FORMAT_NAME: Record<ChallengeFormat, string> = {
-  '1v1': '1v1',
-  pooled: 'Group',
-};
 /** In the design, not in the schema. Shown so the shape of the control matches. */
 const LATER_FORMATS = ['Blitz', 'Bracket'];
+/** A 1v1 is always two seats; only a Group Battle has a size to choose. */
+const HEAD_TO_HEAD_SEATS = 2;
+const DEFAULT_GROUP_SIZE = 4;
 
-/** One screen, four taps: exercise, format, stake, post. */
-export function CreateChallengeScreen({ navigation }: Props) {
-  const { session } = useAuth();
+/**
+ * One screen, four taps: exercise, format, stake, find. Nothing is written
+ * here. The Searching screen owns the queue, so backing out of it never
+ * leaves a half-made bout behind.
+ */
+export function FindBoutScreen({ navigation }: Props) {
   const { profile } = useFitnessProfile();
   const [type, setType] = useState<ChallengeType>('pushups');
   const [format, setFormat] = useState<ChallengeFormat>('1v1');
+  const [groupSize, setGroupSize] = useState<number>(DEFAULT_GROUP_SIZE);
   const [stake, setStake] = useState<number>(250);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const balance = profile?.points_balance ?? null;
   const affordable = (value: number) => balance === null || value <= balance;
   const verifiable = VERIFIABLE_TYPES.has(type);
-  const canPost = verifiable && affordable(stake);
+  const canFind = verifiable && affordable(stake);
 
-  const submit = async () => {
-    setError(null);
-    if (!session) {
-      setError('You must be logged in.');
-      return;
-    }
-    setSubmitting(true);
-    const { data, error: insertError } = await supabase
-      .from('challenges')
-      .insert({
-        type,
-        format,
-        stake_points: stake,
-        created_by: session.user.id,
-      })
-      .select('id')
-      .single();
-    setSubmitting(false);
-
-    if (insertError) {
-      setError(insertError.message);
-      return;
-    }
-    navigation.replace('ChallengeDetail', { challengeId: data.id });
+  const players = format === '1v1' ? HEAD_TO_HEAD_SEATS : groupSize;
+  const sizeIndex = GROUP_SIZES.indexOf(groupSize);
+  const atMin = sizeIndex <= 0;
+  const atMax = sizeIndex >= GROUP_SIZES.length - 1;
+  // Step by position in the list rather than by one, so the offered sizes
+  // stay the single source of truth if they ever stop being contiguous.
+  const stepGroup = (delta: number) => {
+    const next = Math.min(GROUP_SIZES.length - 1, Math.max(0, sizeIndex + delta));
+    setGroupSize(GROUP_SIZES[next]);
   };
+
+  const find = () =>
+    navigation.navigate('Searching', {
+      exerciseType: type,
+      format,
+      maxParticipants: players,
+      stake,
+    });
 
   return (
     <View style={styles.screen}>
-      <PageHead kicker="NEW BOUT" title="CALL IT." />
+      <PageHead kicker="FIND A BOUT" title="CALL IT." />
       <ScrollView
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
@@ -153,6 +146,29 @@ export function CreateChallengeScreen({ navigation }: Props) {
             ))}
           </View>
           <Text style={styles.helper}>{FORMAT_NOTE[format]}</Text>
+
+          {format === 'pooled' ? (
+            <View style={styles.stepper}>
+              <Label size={11}>PLAYERS</Label>
+              <View style={styles.stepperControls}>
+                <IconCircle
+                  icon="minus"
+                  color={atMin ? colors.dim : colors.text}
+                  onPress={atMin ? undefined : () => stepGroup(-1)}
+                  accessibilityLabel="Fewer players"
+                />
+                <Numeral size={24} style={styles.stepperValue}>
+                  {String(groupSize)}
+                </Numeral>
+                <IconCircle
+                  icon="plus"
+                  color={atMax ? colors.dim : colors.text}
+                  onPress={atMax ? undefined : () => stepGroup(1)}
+                  accessibilityLabel="More players"
+                />
+              </View>
+            </View>
+          ) : null}
         </View>
 
         <View>
@@ -202,25 +218,19 @@ export function CreateChallengeScreen({ navigation }: Props) {
       <Dock style={styles.dock}>
         <View style={styles.summary}>
           <Label size={11} color={colors.secondary} tracking={0.12}>
-            {`${EXERCISE_LABEL[type]} · ${FORMAT_LABEL[format]} · ${SEATS} PLAYERS`}
+            {`${EXERCISE_LABEL[type]} · ${FORMAT_NAME[format].toUpperCase()} · ${players} PLAYERS`}
           </Label>
           <Display size={22} color={colors.accent}>
-            {`POT ${fmtPoints(stake * SEATS)}`}
+            {`POT ${fmtPoints(stake * players)}`}
           </Display>
         </View>
-        {error ? (
-          <Notice icon="warning" style={styles.error}>
-            {error}
-          </Notice>
-        ) : null}
-        <Button
-          label="POST THE BOUT"
-          onPress={submit}
-          loading={submitting}
-          disabled={!canPost}
-        />
+        <Text style={styles.dockHelper}>
+          You'll be matched live with fighters at your level. Nothing is staked
+          until the bout is on.
+        </Text>
+        <Button label="FIND A BOUT" onPress={find} disabled={!canFind} />
       </Dock>
-      <TabBar active="create" />
+      <TabBar active="find" />
     </View>
   );
 }
@@ -280,6 +290,17 @@ const styles = StyleSheet.create({
   segTextSoon: { color: colors.dim },
   helper: { ...typography.helper, marginTop: space.sm },
 
+  stepper: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: space.lg,
+    paddingHorizontal: space.xs,
+  },
+  stepperControls: { flexDirection: 'row', alignItems: 'center', gap: space.md },
+  // Fixed width so the circles don't shift when the count changes digits.
+  stepperValue: { minWidth: 28, textAlign: 'center' },
+
   stakeHead: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -308,5 +329,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.xs,
     paddingBottom: space.sm + 2,
   },
-  error: { marginBottom: space.sm + 2 },
+  dockHelper: {
+    ...typography.helper,
+    paddingHorizontal: space.xs,
+    marginBottom: space.sm + 2,
+  },
 });

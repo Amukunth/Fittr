@@ -1,6 +1,5 @@
 import React, { useCallback, useState } from 'react';
 import {
-  Alert,
   Modal,
   Pressable,
   ScrollView,
@@ -77,12 +76,7 @@ export function ProfileScreen({ navigation }: Props) {
     await refresh();
   };
 
-  const settings = () => {
-    Alert.alert('Your corner', session?.user.email ?? undefined, [
-      { text: 'Log out', style: 'destructive', onPress: () => signOut() },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
-  };
+  const settings = () => navigation.navigate('Settings');
 
   if (loading || !profile) {
     return <Loading />;
@@ -214,7 +208,7 @@ export function ProfileScreen({ navigation }: Props) {
                           label="CALL OUT"
                           variant="outline"
                           size="sm"
-                          onPress={() => navigation.navigate('CreateChallenge')}
+                          onPress={() => navigation.navigate('FindBout')}
                         />
                       </View>
                     );
@@ -245,7 +239,7 @@ export function ProfileScreen({ navigation }: Props) {
               <Button
                 label="TAKE A BOUT"
                 size="md"
-                onPress={() => navigation.navigate('Home')}
+                onPress={() => navigation.navigate('FindBout')}
                 style={styles.emptyButton}
               />
             </View>

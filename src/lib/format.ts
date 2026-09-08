@@ -82,3 +82,21 @@ export function relativeDay(iso: string, now: Date = new Date()): string {
   }
   return `${MONTH[then.getMonth()]} ${then.getDate()}`;
 }
+
+function twelveHour(d: Date): string {
+  const h = d.getHours();
+  const suffix = h < 12 ? 'AM' : 'PM';
+  const hour = h % 12 === 0 ? 12 : h % 12;
+  return `${hour}:${String(d.getMinutes()).padStart(2, '0')} ${suffix}`;
+}
+
+/** "Sep 6 · 11:37 PM", with the year when it isn't this one. */
+export function formatDateTime(iso: string, now: Date = new Date()): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    return '';
+  }
+  const day = `${MONTH[d.getMonth()]} ${d.getDate()}`;
+  const year = d.getFullYear() === now.getFullYear() ? '' : `, ${d.getFullYear()}`;
+  return `${day}${year} · ${twelveHour(d)}`;
+}

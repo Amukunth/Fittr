@@ -7,7 +7,7 @@ import type { RootStackParamList } from '../navigation/types';
 import { Icon, type IconName } from '../theme/icons';
 import { colors, label, space } from '../theme/tokens';
 
-export type Tab = 'home' | 'create' | 'profile';
+export type Tab = 'home' | 'find' | 'profile';
 
 const TABS: ReadonlyArray<{
   key: Tab;
@@ -16,12 +16,12 @@ const TABS: ReadonlyArray<{
   route: keyof RootStackParamList;
 }> = [
   { key: 'home', label: 'BOUTS', icon: 'bolt', route: 'Home' },
-  { key: 'create', label: 'CREATE', icon: 'plus-circle', route: 'CreateChallenge' },
+  { key: 'find', label: 'FIND', icon: 'crosshair', route: 'FindBout' },
   { key: 'profile', label: 'PROFILE', icon: 'user', route: 'Profile' },
 ];
 
 /**
- * Bouts / Create / Profile. Rendered by the three top-level screens rather
+ * Bouts / Find / Profile. Rendered by the three top-level screens rather
  * than by a tab navigator: the app is one native stack, and `navigate` to a
  * route already on it pops back rather than pushing, so the stack never
  * grows past those three.

@@ -8,6 +8,7 @@ import React from 'react';
 import { StatusBar } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AuthProvider } from './src/context/AuthContext';
+import { BiometricGate } from './src/components/BiometricGate';
 import { RootNavigator } from './src/navigation/RootNavigator';
 
 function App() {
@@ -19,7 +20,11 @@ function App() {
           background — no backgroundColor prop needed (or accepted). */}
       <StatusBar barStyle="light-content" />
       <AuthProvider>
-        <RootNavigator />
+        {/* Inside AuthProvider (it needs the session) and around the
+            navigator, so the biometric lock covers every signed-in screen. */}
+        <BiometricGate>
+          <RootNavigator />
+        </BiometricGate>
       </AuthProvider>
     </SafeAreaProvider>
   );

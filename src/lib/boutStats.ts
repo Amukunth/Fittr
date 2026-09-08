@@ -12,10 +12,19 @@ import { formatSeconds } from './format';
 /**
  * Pure derivation of a user's record from the rows the app can read. Kept
  * free of Supabase so it can be unit-tested (__tests__/boutStats.test.ts)
- * and so Profile and ChallengeDetail agree on every number.
+ * and so Home, Profile and Results agree on every number.
+ *
+ * A bout has 2..6 seats (challenges.max_participants). Everything here is
+ * written for the field, with `opponentId` / `opponentScore` kept as "the
+ * first opponent" for the 1v1 surfaces.
  */
 
 export type Outcome = 'win' | 'loss' | 'tie' | 'pending' | 'review';
+
+export interface OpponentScore {
+  userId: string;
+  score: number | null;
+}
 
 export interface BoutSummary {
   matchId: string;
@@ -23,12 +32,17 @@ export interface BoutSummary {
   type: ChallengeType;
   format: ChallengeFormat;
   stake: number;
+  /** Seats on the match: 2 for 1v1, 3..6 for a Group Battle. */
+  seats: number;
   status: ChallengeStatus;
-  /** Match creation, i.e. when it was accepted. */
+  /** Match creation, i.e. when the lobby filled. */
   createdAt: string;
   settledAt: string | null;
   winnerId: string | null;
   myScore: number | null;
+  /** Every other fighter on the match, best score first, unscored last. */
+  opponents: OpponentScore[];
+  /** The first opponent (the only one in a 1v1). */
   opponentId: string | null;
   opponentScore: number | null;
   outcome: Outcome;
@@ -49,6 +63,8 @@ export type HistoryMark = 'W' | 'L' | 'T';
 export interface BoutStats {
   /** Newest first. */
   bouts: BoutSummary[];
+  /** Unsettled bouts the user still has to fight or wait on, newest first. */
+  active: BoutSummary[];
   /** Settled bouts only. */
   played: number;
   wins: number;
@@ -78,6 +94,7 @@ export interface BoutRows {
 
 export const EMPTY_STATS: BoutStats = {
   bouts: [],
+  active: [],
   played: 0,
   wins: 0,
   losses: 0,
@@ -117,21 +134,59 @@ export function formatScore(
 }
 
 /** Higher is better except race, where a faster time wins. */
-function isBetter(candidate: number, current: number, type: ChallengeType) {
+export function isBetter(candidate: number, current: number, type: ChallengeType) {
   return type === 'race' ? candidate < current : candidate > current;
 }
 
-function outcomeOf(match: MatchRow, status: ChallengeStatus, userId: string) {
+/** Best score first; unscored fighters last. */
+export function sortByScore<T extends { score: number | null }>(
+  rows: T[],
+  type: ChallengeType,
+): T[] {
+  return [...rows].sort((a, b) => {
+    if (a.score === null && b.score === null) {
+      return 0;
+    }
+    if (a.score === null) {
+      return 1;
+    }
+    if (b.score === null) {
+      return -1;
+    }
+    if (a.score === b.score) {
+      return 0;
+    }
+    return isBetter(a.score, b.score, type) ? -1 : 1;
+  });
+}
+
+/**
+ * How the bout went for `userId`. `winner_id` alone is not enough once a
+ * bout can have more than two seats: settle_match() leaves it NULL for any
+ * tie, and in a 3-way bout where two fighters tie for first the third has
+ * still lost. The ledger tells them apart — a fighter who got any of the
+ * pot back (their delta is better than losing the whole stake) shared it.
+ */
+export function outcomeOf(
+  match: Pick<MatchRow, 'settled_at' | 'winner_id'>,
+  status: ChallengeStatus,
+  userId: string,
+  delta: number,
+  stake: number,
+): Outcome {
   if (status === 'needs_review') {
-    return 'review' as const;
+    return 'review';
   }
   if (match.settled_at === null) {
-    return 'pending' as const;
+    return 'pending';
   }
-  if (match.winner_id === null) {
-    return 'tie' as const;
+  if (match.winner_id === userId) {
+    return 'win';
   }
-  return match.winner_id === userId ? ('win' as const) : ('loss' as const);
+  if (match.winner_id === null && delta > -stake) {
+    return 'tie';
+  }
+  return 'loss';
 }
 
 export function deriveBoutStats(userId: string, rows: BoutRows): BoutStats {
@@ -162,25 +217,32 @@ export function deriveBoutStats(userId: string, rows: BoutRows): BoutStats {
     if (!match || !challenge) {
       continue;
     }
-    const opponent =
-      (participantsByMatch.get(me.match_id) ?? []).find(
-        p => p.user_id !== userId,
-      ) ?? null;
+    const field = participantsByMatch.get(me.match_id) ?? [];
+    const opponents = sortByScore(
+      field
+        .filter(p => p.user_id !== userId)
+        .map(p => ({ userId: p.user_id, score: scoreFor(p, challenge.type) })),
+      challenge.type,
+    );
+    const delta = ledgerByMatch.get(me.match_id) ?? -challenge.stake_points;
+    const first = opponents[0] ?? null;
     bouts.push({
       matchId: match.id,
       challengeId: challenge.id,
       type: challenge.type,
       format: challenge.format,
       stake: challenge.stake_points,
+      seats: challenge.max_participants,
       status: challenge.status,
       createdAt: match.created_at,
       settledAt: match.settled_at,
       winnerId: match.winner_id,
       myScore: scoreFor(me, challenge.type),
-      opponentId: opponent?.user_id ?? null,
-      opponentScore: opponent ? scoreFor(opponent, challenge.type) : null,
-      outcome: outcomeOf(match, challenge.status, userId),
-      delta: ledgerByMatch.get(me.match_id) ?? -challenge.stake_points,
+      opponents,
+      opponentId: first?.userId ?? null,
+      opponentScore: first?.score ?? null,
+      outcome: outcomeOf(match, challenge.status, userId, delta, challenge.stake_points),
+      delta,
     });
   }
   bouts.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
@@ -225,26 +287,25 @@ export function deriveBoutStats(userId: string, rows: BoutRows): BoutStats {
 
   const rivalMap = new Map<string, RivalSummary>();
   for (const b of bouts) {
-    if (!b.opponentId) {
-      continue;
+    for (const opponent of b.opponents) {
+      const r = rivalMap.get(opponent.userId) ?? {
+        userId: opponent.userId,
+        bouts: 0,
+        wins: 0,
+        losses: 0,
+        lastPlayedAt: b.createdAt,
+      };
+      r.bouts += 1;
+      if (b.outcome === 'win') {
+        r.wins += 1;
+      } else if (b.outcome === 'loss') {
+        r.losses += 1;
+      }
+      if (b.createdAt > r.lastPlayedAt) {
+        r.lastPlayedAt = b.createdAt;
+      }
+      rivalMap.set(opponent.userId, r);
     }
-    const r = rivalMap.get(b.opponentId) ?? {
-      userId: b.opponentId,
-      bouts: 0,
-      wins: 0,
-      losses: 0,
-      lastPlayedAt: b.createdAt,
-    };
-    r.bouts += 1;
-    if (b.outcome === 'win') {
-      r.wins += 1;
-    } else if (b.outcome === 'loss') {
-      r.losses += 1;
-    }
-    if (b.createdAt > r.lastPlayedAt) {
-      r.lastPlayedAt = b.createdAt;
-    }
-    rivalMap.set(b.opponentId, r);
   }
   const rivals = [...rivalMap.values()].sort(
     (a, b) => b.bouts - a.bouts || (a.lastPlayedAt < b.lastPlayedAt ? 1 : -1),
@@ -252,6 +313,7 @@ export function deriveBoutStats(userId: string, rows: BoutRows): BoutStats {
 
   return {
     bouts,
+    active: bouts.filter(b => b.outcome === 'pending'),
     played: settled.length,
     wins,
     losses,

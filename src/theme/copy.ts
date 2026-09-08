@@ -3,6 +3,7 @@ import type {
   ChallengeStatus,
   ChallengeType,
   LedgerReason,
+  NotificationPrefs,
   StrengthTier,
 } from '../types/database';
 import type { IconName } from './icons';
@@ -60,19 +61,25 @@ export const FORMAT_LABEL: Record<ChallengeFormat, string> = {
 };
 
 export const FORMAT_NOTE: Record<ChallengeFormat, string> = {
-  '1v1': 'Head-to-head. Winner takes both stakes.',
+  '1v1': 'Head-to-head. Matched live with a fighter at your level. Winner takes both stakes.',
   pooled:
-    'Open table. The first fighter at your level to answer takes the seat and the pot goes to the winner.',
+    'Group Battle. The lobby fills live, the bout opens for everyone at once, top finisher takes the pot.',
+};
+
+/** What the format is called on a card. */
+export const FORMAT_NAME: Record<ChallengeFormat, string> = {
+  '1v1': '1v1',
+  pooled: 'Group Battle',
 };
 
 /**
- * Both formats resolve to a two-seat match in v1 (BACKEND.md, assumption
- * 4): a challenge is the offer, the first same-tier taker completes it.
+ * Group Battle sizes offered by Find a Bout. The database allows 2..6 on
+ * challenges.max_participants; 2 is always a 1v1.
  */
-export const SEATS = 2;
+export const GROUP_SIZES: readonly number[] = [3, 4, 5, 6];
 
 export const STATUS_LABEL: Record<ChallengeStatus, string> = {
-  open: 'OPEN',
+  open: 'FORMING',
   matched: 'MATCHED',
   in_progress: 'LIVE',
   completed: 'SETTLED',
@@ -122,3 +129,61 @@ export const STARTER_PURSE = 500;
 
 export const UNIT = 'PTS';
 export const UNIT_LONG = 'POINTS';
+
+// ── Settings ────────────────────────────────────────────────────────────
+
+export interface NotificationPrefDef {
+  key: keyof NotificationPrefs;
+  label: string;
+  desc: string;
+}
+
+/** Notification toggles, in the order the design lists them. */
+export const NOTIFICATION_PREFS: readonly NotificationPrefDef[] = [
+  { key: 'callouts', label: 'Call-outs', desc: 'Someone takes your bout or challenges you directly' },
+  { key: 'results', label: 'Bout results', desc: 'Settlement and rank moves' },
+  { key: 'reminders', label: 'Reminders', desc: 'A bout is waiting on your round' },
+];
+
+/** Transaction-history vocabulary for the points ledger. */
+export const TRANSACTION_LABEL: Record<LedgerReason, string> = {
+  bonus: 'Bonus credit',
+  stake: 'Wager',
+  payout: 'Win',
+};
+
+export interface CashoutMethodDef {
+  key: 'venmo' | 'paypal' | 'debit' | 'ach';
+  label: string;
+  /** Typical processing time, shown per method. */
+  time: string;
+}
+
+export const CASHOUT_METHODS: readonly CashoutMethodDef[] = [
+  { key: 'venmo', label: 'Venmo', time: 'Instant to 1 business day' },
+  { key: 'paypal', label: 'PayPal', time: 'Instant to 1 business day' },
+  { key: 'debit', label: 'Debit card', time: 'Usually under 30 minutes' },
+  { key: 'ach', label: 'Bank transfer (ACH)', time: '1–3 business days' },
+];
+
+export interface DepositMethodDef {
+  key: 'card' | 'applepay' | 'paypal' | 'venmo';
+  label: string;
+}
+
+export const DEPOSIT_METHODS: readonly DepositMethodDef[] = [
+  { key: 'card', label: 'Debit or credit card' },
+  { key: 'applepay', label: 'Apple Pay' },
+  { key: 'paypal', label: 'PayPal' },
+  { key: 'venmo', label: 'Venmo' },
+];
+
+/** Whole dollars, for the deposit amount grid. */
+export const DEPOSIT_PRESETS_USD: readonly number[] = [5, 10, 20, 50, 100];
+
+/**
+ * Shown on every money screen while the app runs on points. Real-money
+ * play is a server-side decision; nothing on the client can switch it on.
+ */
+export const REAL_MONEY_NOTICE =
+  'Real-money play is not switched on yet. Points are free during the pilot and have no cash value.';
