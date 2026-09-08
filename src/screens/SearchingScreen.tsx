@@ -566,7 +566,9 @@ export function SearchingScreen({ route, navigation }: Props) {
 
         {phase === 'ended' || phase === 'error' ? (
           <View style={styles.block}>
-            <Display size={40}>{phase === 'error' ? 'NO BOUT\nYET.' : 'SEARCH\nOVER.'}</Display>
+            {/* 'error' means the server refused to start the search at all —
+                it must not read as "we looked and found nobody". */}
+            <Display size={40}>{phase === 'error' ? "CAN'T\nSEARCH." : 'SEARCH\nOVER.'}</Display>
             <Body muted style={styles.blockBody}>
               {message}
             </Body>

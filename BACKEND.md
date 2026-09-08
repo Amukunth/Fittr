@@ -856,6 +856,55 @@ Two related product decisions, both defaults that can be reversed:
   indefinitely. See the limitation below — the queue row itself has no such
   bound.
 
+### `round_open` looked like a broken search (2026-09-08)
+
+**Symptom:** tapping FIND A BOUT ended the search instantly, every time.
+
+**It was not matchmaking.** `matchmaking_queue` was empty and there were zero
+open lobbies — `enter_matchmaking()` was raising before it ever inserted a
+row. The guard being hit was `round_open`: both test accounts were
+participants in two unsettled bouts from the previous 24 hours that had never
+been played (no `verification_sessions` row). The client then flipped to the
+`error` phase, which rendered "NO BOUT YET." — indistinguishable, to the user,
+from a search that ran and found nobody.
+
+Three separate things were wrong, and only the first was the actual bug:
+
+1. **Abandoned test bouts accumulate and block queueing.** This is the "no
+   forfeit rule" limitation below, met in practice. Every bout matched during
+   testing and then abandoned at the camera step locks both fighters' stakes
+   and blocks them both for 24 hours.
+2. **The rejection was invisible until after navigation.** FindBout already
+   pre-flighted affordability but not open rounds, so a doomed search was the
+   only way to discover the block.
+3. **The `error` copy claimed a result.** "NO BOUT YET." reads as an outcome
+   of searching; the server had refused to search at all.
+
+**Fixes.** FindBout now finds the blocking bout itself — an `active` bout with
+`myScore === null` inside `OPEN_ROUND_BLOCKS_FOR_MS` (hand-mirrored from
+`_mm_open_round_blocks_for()`) — disables FIND A BOUT, and offers a button
+straight into that round. The server stays the authority; this only saves a
+trip to a screen that would fail on arrival. The `error` heading is now
+"CAN'T SEARCH."
+
+**Data operation (live DB, 2026-09-08, one-off).** With the user's approval,
+all 11 unsettled matches were voided and refunded. Refunds were computed from
+the *actual* `points_ledger_entries` debits per `(match, user)` rather than
+from `challenges.stake_points`, so the operation could not invent or lose
+points, and it mirrored `settle_match()`'s `tie_refunded` bookkeeping exactly:
+credit `fitness_profiles.points_balance`, write one `payout` ledger entry per
+participant per match, `matches.winner_id = NULL, settled_at = now()`,
+`challenges.status = 'completed'`. Applied in a single transaction that
+asserted, before committing, that no `payout` already existed on those
+matches, that no unsettled match remained, and that the net ledger across the
+voided matches was exactly 0. 920 points returned across 4 fighters; all five
+accounts landed on exactly 500, their starting balance, which is the
+independent check that the arithmetic was right. Row-level backups of every
+touched table were written first.
+
+This was a cleanup of test data, not a substitute for the forfeit rule — the
+underlying gap is unchanged and will recur on the next abandoned bout.
+
 ### Known limitations — decisions deferred, not oversights
 
 - **No forfeit rule.** `settle_match()` returns `not_ready` until every
@@ -948,19 +997,23 @@ everything else; the suite adds ~6 s.
 `embedded-postgres` is ESM and loads its platform binary with a dynamic
 `import()`, which Jest's CommonJS runtime refuses.
 
-### Deploy status: NOT deployed
+### Deploy status: applied 2026-09-08
 
-`prisma/migrations/20260908000000_live_matchmaking_queue/migration.sql` has
-**not** been applied to the live Supabase project. Neither has
-`20260907000000_settings_profile` (written 2026-09-07, still pending). Both
-go in the same `npm run db:deploy`, in filename order.
+Both `20260907000000_settings_profile` and
+`20260908000000_live_matchmaking_queue` were applied to the live Supabase
+project at **2026-09-08 18:23**, neither rolled back (verified against
+`_prisma_migrations`, which now matches `prisma/migrations/` exactly — 12
+local directories, 12 applied rows, plus the waitlist app's own 4). The
+shipping build is EAS iOS `preview` on commit `30a6efc`.
 
-Before deploying, note that the live database currently holds **11
-matched-but-unsettled challenges** and 0 open ones (checked read-only on
-2026-09-08). The migration's `DELETE FROM challenges WHERE status = 'open'
-AND no match` therefore removes nothing today, and `max_participants`
-back-fills to 2, so those 11 bouts settle exactly as before. Deploying while
-a user still has the *old* build installed would break their app — it would
-try to insert challenges it no longer has the grant for — so this migration
-and an EAS build should ship together; see the commit → push → build →
-install loop in the README.
+Verified read-only after deploying: `matchmaking_queue`,
+`matchmaking_presence`, `enter_matchmaking`, `matchmaking_heartbeat` and
+`leave_matchmaking` all present; `join_challenge` gone; the 11 pre-existing
+matched-but-unsettled bouts untouched by the migration and back-filled to
+`max_participants = 2` as intended. Those 11 were later voided and refunded
+as a separate, deliberate data operation — see "`round_open` looked like a
+broken search" above; the migration itself moved no points.
+
+Because the old build inserts challenges it no longer has the grant for, a
+migration and its EAS build ship together: commit → push → `npm run
+db:deploy` → `eas build` → install. See the README loop.

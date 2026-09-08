@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { useBoutHistory } from '../hooks/useBoutHistory';
 import { useFitnessProfile } from '../hooks/useFitnessProfile';
 import { compactPoints, fmtPoints } from '../lib/format';
 import type { RootStackParamList } from '../navigation/types';
@@ -38,6 +39,13 @@ const LATER_FORMATS = ['Blitz', 'Bracket'];
 /** A 1v1 is always two seats; only a Group Battle has a size to choose. */
 const HEAD_TO_HEAD_SEATS = 2;
 const DEFAULT_GROUP_SIZE = 4;
+/**
+ * Mirrors `_mm_open_round_blocks_for()` in the matchmaking migration: a bout
+ * you have not played yet blocks queueing until it is this old. Kept in step
+ * with the SQL by hand — the server stays the authority, this only saves the
+ * user a trip to a Searching screen that would fail on arrival.
+ */
+const OPEN_ROUND_BLOCKS_FOR_MS = 24 * 60 * 60 * 1000;
 
 /**
  * One screen, four taps: exercise, format, stake, find. Nothing is written
@@ -46,6 +54,7 @@ const DEFAULT_GROUP_SIZE = 4;
  */
 export function FindBoutScreen({ navigation }: Props) {
   const { profile } = useFitnessProfile();
+  const { stats } = useBoutHistory();
   const [type, setType] = useState<ChallengeType>('pushups');
   const [format, setFormat] = useState<ChallengeFormat>('1v1');
   const [groupSize, setGroupSize] = useState<number>(DEFAULT_GROUP_SIZE);
@@ -54,7 +63,24 @@ export function FindBoutScreen({ navigation }: Props) {
   const balance = profile?.points_balance ?? null;
   const affordable = (value: number) => balance === null || value <= balance;
   const verifiable = VERIFIABLE_TYPES.has(type);
-  const canFind = verifiable && affordable(stake);
+
+  // The bout that `enter_matchmaking` would reject this search over: still
+  // live, still unplayed by me, still inside the blocking window. Catching it
+  // here is the difference between "you have a round to finish" and a search
+  // that appears to end the instant it starts.
+  const openRound = useMemo(() => {
+    if (!stats) {
+      return null;
+    }
+    const cutoff = Date.now() - OPEN_ROUND_BLOCKS_FOR_MS;
+    return (
+      stats.active.find(
+        b => b.myScore === null && new Date(b.createdAt).getTime() > cutoff,
+      ) ?? null
+    );
+  }, [stats]);
+
+  const canFind = verifiable && affordable(stake) && openRound === null;
 
   const players = format === '1v1' ? HEAD_TO_HEAD_SEATS : groupSize;
   const sizeIndex = GROUP_SIZES.indexOf(groupSize);
@@ -213,6 +239,21 @@ export function FindBoutScreen({ navigation }: Props) {
             plank and wall-sit are on the card now.
           </Notice>
         ) : null}
+
+        {openRound ? (
+          <View style={styles.blocked}>
+            <Notice icon="warning" iconColor={colors.accent}>
+              {`You've got a ${EXERCISE_LABEL[openRound.type]} round waiting. Finish it before you call another bout — your stake is already in.`}
+            </Notice>
+            <Button
+              label="GO TO YOUR ROUND"
+              variant="card"
+              onPress={() =>
+                navigation.navigate('MatchInProgress', { matchId: openRound.matchId })
+              }
+            />
+          </View>
+        ) : null}
       </ScrollView>
 
       <Dock style={styles.dock}>
@@ -244,6 +285,7 @@ const styles = StyleSheet.create({
     gap: space.xxl,
   },
   fieldLabel: { marginBottom: space.sm + 2 },
+  blocked: { gap: space.sm },
 
   grid: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm },
   tile: {
