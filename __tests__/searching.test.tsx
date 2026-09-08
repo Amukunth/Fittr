@@ -317,6 +317,54 @@ describe('SearchingScreen', () => {
     await unmount(tree);
   });
 
+  it('gives up and leaves the queue after 30s with no match', async () => {
+    const { tree } = await mount();
+    await ReactTestRenderer.act(async () => {
+      mockChannels[0]!.callback!('SUBSCRIBED');
+    });
+    await flush();
+    expect(text(tree)).toContain('SEARCHING');
+
+    mockRpcHandler = () => ({ data: queueRow({ status: 'cancelled' }), error: null });
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(30_000);
+    });
+    await flush();
+
+    expect(mockRpcCalls.map(c => c.fn)).toContain('leave_matchmaking');
+    const rendered = text(tree);
+    expect(rendered).toContain('SEARCH OVER');
+    expect(rendered).toContain('No fighters found in 30s');
+    expect(rendered).toContain('SEARCH AGAIN');
+
+    await unmount(tree);
+  });
+
+  it('does not give up if the lobby fills in the same instant as the 30s timeout', async () => {
+    const { tree, calls } = await mount();
+    await ReactTestRenderer.act(async () => {
+      mockChannels[0]!.callback!('SUBSCRIBED');
+    });
+    await flush();
+
+    mockRpcHandler = () => ({
+      data: queueRow({ status: 'matched', match_id: 'match-timeout' }),
+      error: null,
+    });
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(30_000);
+    });
+    await flush();
+    expect(text(tree)).toContain("IT'S ON");
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(4000);
+    });
+    expect(calls.replace).toEqual([['MatchInProgress', { matchId: 'match-timeout' }]]);
+
+    await unmount(tree);
+  });
+
   it('leaves the queue when the fighter backs out, and tears the channel down', async () => {
     const { tree, calls } = await mount();
     await ReactTestRenderer.act(async () => {

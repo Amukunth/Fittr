@@ -98,6 +98,8 @@ const SUBSCRIBE_FALLBACK_MS = 4000;
 const BEAT_TIMEOUT_MS = 8000;
 /** Attempts at leaving before giving up and letting the TTL do it. */
 const LEAVE_ATTEMPTS = 3;
+/** No opponent in this long: stop searching and show the empty-result page. */
+const SEARCH_TIMEOUT_SECONDS = 30;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -383,18 +385,6 @@ export function SearchingScreen({ route, navigation }: Props) {
     };
   }, [applyRow, endSearch, onMatched]);
 
-  // ── Clock ─────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (phase !== 'searching') {
-      return;
-    }
-    const tick = setInterval(() => {
-      setElapsed(Math.max(0, Math.floor((Date.now() - startedAtRef.current) / 1000)));
-    }, 1000);
-    return () => clearInterval(tick);
-  }, [phase]);
-
   // ── Leaving ───────────────────────────────────────────────────────────
 
   const leaveWithRetry = useCallback(async (id: string) => {
@@ -432,6 +422,38 @@ export function SearchingScreen({ route, navigation }: Props) {
     return true;
   }, [leaveWithRetry, onMatched]);
 
+  // ── Clock ─────────────────────────────────────────────────────────────
+
+  const timedOutRef = useRef(false);
+
+  const giveUp = useCallback(async () => {
+    if (timedOutRef.current || matchedRef.current || phaseRef.current !== 'searching') {
+      return;
+    }
+    timedOutRef.current = true;
+    // Same exit path as Cancel: if the lobby filled in the same instant as
+    // the timeout fired, `leave` routes into the bout instead of ending.
+    const ok = await leave();
+    if (ok && !goneRef.current) {
+      setMessage(`No fighters found in ${SEARCH_TIMEOUT_SECONDS}s. Try again, or pick a different stake or tier.`);
+      setPhaseTracked('ended');
+    }
+  }, [leave, setPhaseTracked]);
+
+  useEffect(() => {
+    if (phase !== 'searching') {
+      return;
+    }
+    const tick = setInterval(() => {
+      const secs = Math.max(0, Math.floor((Date.now() - startedAtRef.current) / 1000));
+      setElapsed(secs);
+      if (secs >= SEARCH_TIMEOUT_SECONDS) {
+        giveUp();
+      }
+    }, 1000);
+    return () => clearInterval(tick);
+  }, [phase, giveUp]);
+
   useEffect(() => {
     const unsubscribe = navigation.addListener('beforeRemove', event => {
       // Our own replace() into the bout, or a search that already ended:
@@ -463,6 +485,7 @@ export function SearchingScreen({ route, navigation }: Props) {
   const searchAgain = useCallback(() => {
     enteredRef.current = false;
     matchedRef.current = false;
+    timedOutRef.current = false;
     queueIdRef.current = null;
     parkedEventsRef.current.clear();
     setMessage(null);

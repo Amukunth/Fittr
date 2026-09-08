@@ -814,6 +814,16 @@ Order of operations, each step earned:
    the publication reports exactly like this, and the heartbeat would
    otherwise mask it as mere slowness — the failure mode this file has warned
    about since the realtime migration.
+7. **A client-side 30-second give-up (2026-09-08).** `SEARCH_TIMEOUT_SECONDS`
+   in `SearchingScreen.tsx` — not a server concept, the queue row itself is
+   untouched by it. If 30s of wall-clock elapse in the `searching` phase with
+   no match, the screen calls `leave_matchmaking()` (the same path Cancel
+   uses) and shows the search-ended page with a "no fighters found" message
+   and a Search Again button, rather than waiting on the server's 20s TTL /
+   45s tier-widen cycle indefinitely. Guarded the same way as every other
+   transition here: if the lobby fills in the same instant the timeout fires,
+   `leave_matchmaking()` answers `matched` and the fighter goes into the bout
+   instead of seeing "no fighters found" for a bout they're actually in.
 
 ### Home, reworked — flagged as a product decision
 
@@ -841,8 +851,10 @@ Two related product decisions, both defaults that can be reversed:
   within 24 hours of the bout). Without it, a user could start bouts and
   abandon them, freezing opponents' stakes. The 24-hour ceiling exists so an
   abandoned bout does not lock them out permanently.
-- **Group sizes are 3-6** and a lobby that never fills waits indefinitely
-  with a visible timer and a Cancel button. See the limitation below.
+- **Group sizes are 3-6** and a lobby that never fills within 30s gives up
+  client-side (see "The Searching screen" above) rather than waiting
+  indefinitely. See the limitation below — the queue row itself has no such
+  bound.
 
 ### Known limitations — decisions deferred, not oversights
 
@@ -855,12 +867,16 @@ Two related product decisions, both defaults that can be reversed:
   fix is a deadline on `matches` after which non-submitters are forfeited and
   the rest settle — deliberately not invented here, because "forfeit after N
   hours" versus "void and refund" is a product call.
-- **An unfilled Group Battle waits forever.** With exact matching on
-  exercise, format, size, stake and tier, a 6-player 500-point lobby may
-  never fill on a small user base. The options are starting short after a
-  timeout, hard-expiring the lobby, or leaving it unbounded; unbounded with a
-  visible timer and a Cancel button was chosen as the least surprising
-  default, but it is a guess.
+- **An unfilled Group Battle still has no server-side expiry.** With exact
+  matching on exercise, format, size, stake and tier, a 6-player 500-point
+  lobby may never fill on a small user base. As of 2026-09-08 each fighter's
+  own screen gives up after 30s and leaves (see "The Searching screen"), but
+  that is a per-viewer client behavior, not a lobby lifetime: a member who
+  closes the app without the client running the give-up (or without hitting
+  Cancel) still only expires by the 20s TTL once their heartbeats stop, and a
+  half-filled lobby with no live viewers can sit until swept. Starting short
+  after a timeout, or hard-expiring the lobby row itself, remain unbuilt
+  product calls.
 - **Stake is never widened**, only tier is. Matching across stakes would need
   a rule for what the pot is.
 - **No push notifications.** Unchanged from before: a backgrounded app is not
