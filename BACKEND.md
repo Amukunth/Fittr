@@ -1366,19 +1366,28 @@ Because the old build inserts challenges it no longer has the grant for, a
 migration and its EAS build ship together: commit → push → `npm run
 db:deploy` → `eas build` → install. See the README loop.
 
-### ⚠️ Deploy status: `20260909000000_skill_ratings` is NOT applied
+### Deploy status: applied 2026-09-10
 
-Written and tested locally on 2026-09-09; **not yet run against the live
-Supabase project**, and no EAS build carries the client half. Until
-`npm run db:deploy` runs, the live database still pairs on `strength_tier`
-and has no `skill_ratings` table — so a build containing these screens would
-fail its `my_skill_ratings` read. Migration and build ship together, as
-always: commit → push → `npm run db:deploy` → `eas build` → install.
+`20260909000000_skill_ratings` was applied to the live Supabase project
+together with `20260910000000_performance_norms` (below) on **2026-09-10**,
+via `npm run db:deploy`. Verified independently afterward by direct
+introspection, not just the CLI's exit code: `skill_ratings`,
+`skill_rating_events`, the `my_skill_ratings` view, `matchmaking_queue.mmr`
+/ `.placement_complete`, and every function this section names
+(`settle_match`, `_mmr_rate_match`, `_mm_find_lobby`, `enter_matchmaking`,
+`rank_tier_for`) all exist on the live database; `_mm_tier_rank()` and
+`_mm_tier_widen_after()` are confirmed gone. `rank_tier_for(1000)` returns
+`squire` against the live database, matching the seed. `npx prisma migrate
+status` reports the schema up to date. No EAS build has shipped the client
+half yet — see the README loop (commit → push → `npm run db:deploy` →
+`eas build` → install) for the remaining step.
 
-Two things to check by hand immediately after deploying, both called out
-under "What is NOT verified about ratings": that `my_skill_ratings` is
-readable through PostgREST (Profile shows rank rows rather than nothing), and
-that a real settled bout writes a `skill_rating_events` row.
+The two checks this section used to flag as unverified — `my_skill_ratings`
+readable through PostgREST, and a real settled bout writing a
+`skill_rating_events` row — are **still open**: introspection confirms the
+view and table exist and are shaped correctly, not that a real device has
+successfully read or written through them yet. See "What is NOT verified
+about ratings" above, which still applies in full.
 
 ## Real-world percentile seeding (2026-09-10)
 
@@ -1658,11 +1667,24 @@ rating system, plus two specific to this feature:
    exercised against a live profile — they typecheck and follow the
    existing save-on-tap pattern, but no test mounts the screen.
 
-### ⚠️ Deploy status: `20260910000000_performance_norms` is NOT applied
+### Deploy status: applied 2026-09-10
 
-Written and tested locally on 2026-09-10, layered on top of
-`20260909000000_skill_ratings`, which is **also still not applied** (see
-above). Neither is on the live Supabase project; no EAS build carries the
-client half. Same loop as always: commit → push → `npm run db:deploy` →
-`eas build` → install — and both pending migrations go together, in
-order, in the same deploy.
+Applied to the live Supabase project on **2026-09-10**, in the same
+`npm run db:deploy` run as `20260909000000_skill_ratings` immediately
+above it (both were pending together; `migrate deploy` applied them in
+order in one invocation). Verified independently afterward: `performance_norms`
+holds exactly 147 rows and `race_standards` exactly 2, matching the local
+embedded-Postgres test counts precisely; `fitness_profiles.gender` and
+`.age_band` exist; `_mmr_from_percentile`, `_mmr_seed_from_norms` and
+`_mmr_seed_from_race_time` all exist and are callable; `_mmr_from_percentile(50)`
+returns `1000` against the live database. Client grants confirmed exactly
+as intended: `authenticated` has `SELECT` on `skill_ratings` and nothing
+else — **no grant at all** exists on `performance_norms` or
+`race_standards`, on the live database, not just in the migration source.
+
+**Not yet done: an EAS build carrying the client half** (the "ABOUT YOU"
+gender/age chips in ProfileEditor, and the profile/results screens reading
+the now-live tables). The commit is pushed to `main`; the next step in the
+usual loop is `eas build` → install. Until that build ships, the running
+app still shows the old Settings screen — the database is ready, the
+client on people's phones is not yet.
