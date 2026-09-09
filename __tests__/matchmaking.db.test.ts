@@ -13,6 +13,7 @@ import {
   balance,
   createUser,
   rpcAsUser,
+  createRatedUser,
   rpcRow,
   startTestDb,
   type TestDb,
@@ -111,18 +112,6 @@ async function matchesOf(ids: string[]): Promise<Map<string, string[]>> {
     map.set(r.user_id, [...(map.get(r.user_id) ?? []), r.match_id]);
   }
   return map;
-}
-
-/** Rewind a lobby's clock (and its members' joined_at) by `seconds`. */
-async function ageLobby(challengeId: string, seconds: number) {
-  await db.pool.query(
-    "UPDATE challenges SET created_at = created_at - make_interval(secs => $2) WHERE id = $1",
-    [challengeId, seconds],
-  );
-  await db.pool.query(
-    'UPDATE matchmaking_queue SET joined_at = joined_at - make_interval(secs => $2) WHERE challenge_id = $1',
-    [challengeId, seconds],
-  );
 }
 
 async function ageEntry(queueId: string, seconds: number) {
@@ -249,20 +238,22 @@ describe('enter_matchmaking', () => {
     expect(await count('SELECT 1 FROM matchmaking_presence WHERE queue_id IN ($1, $2)', [first.id, second.id])).toBe(0);
   });
 
-  it('keeps different stakes, exercises, sizes and tiers in separate lobbies', async () => {
-    const [a, b, c, d, e] = await users(5);
+  // strength_tier used to be the fifth dimension here. It no longer
+  // separates anything: pairing is on MMR, and separation by rating is
+  // tested in skillRating.db.test.ts, where fighters can be given the
+  // placed ratings the rule actually reads.
+  it('keeps different stakes, exercises and sizes in separate lobbies', async () => {
+    const [a, b, c, d] = await users(4);
     const base = await enter(a!, { stake: 100 });
     const otherStake = await enter(b!, { stake: 250 });
     const otherExercise = await enter(c!, { exercise: 'plank' });
     const groupOfFour = await enter(d!, { format: 'pooled', seats: 4 });
-    const otherTier = await enter(await createUser(db, { tier: 'advanced' }), { stake: 100 });
-    for (const row of [base, otherStake, otherExercise, groupOfFour, otherTier]) {
+    for (const row of [base, otherStake, otherExercise, groupOfFour]) {
       expect(row.status).toBe('searching');
       expect(row.lobby_size).toBe(1);
     }
-    const lobbies = new Set([base, otherStake, otherExercise, groupOfFour, otherTier].map(r => r.challenge_id));
-    expect(lobbies.size).toBe(5);
-    expect(e).toBeDefined();
+    const lobbies = new Set([base, otherStake, otherExercise, groupOfFour].map(r => r.challenge_id));
+    expect(lobbies.size).toBe(4);
   });
 
   it('answers a repeated identical request with the same entry', async () => {
@@ -387,12 +378,15 @@ describe('concurrent entry (the correctness requirement)', () => {
     expect(results.filter(r => r.status === 'matched')).toHaveLength(2);
   });
 
-  it('pairs within tier even when three tiers arrive at once', async () => {
-    const tiers: Tier[] = ['beginner', 'intermediate', 'advanced'];
-    const all: Array<{ user: string; tier: Tier }> = [];
-    for (const tier of tiers) {
-      for (const u of await users(2, tier, 1000)) {
-        all.push({ user: u, tier });
+  it('pairs within the MMR window even when three bands arrive at once', async () => {
+    // The tier version of this test paired on strength_tier. Rating is now
+    // the signal, so the fighters are PLACED (an unplaced one matches
+    // anybody by design) and 400 apart, which no window admits.
+    const bands = [1000, 1400, 1800];
+    const all: Array<{ user: string; band: number }> = [];
+    for (const band of bands) {
+      for (let i = 0; i < 2; i += 1) {
+        all.push({ user: await createRatedUser(db, 'wallsit', band, { points: 1000 }), band });
       }
     }
     await Promise.all(all.map(x => enter(x.user, { exercise: 'wallsit', stake: 500 })));
@@ -402,7 +396,7 @@ describe('concurrent entry (the correctness requirement)', () => {
       expect(mine).toHaveLength(1);
       const others = (await participantsOf(mine[0]!)).filter(u => u !== x.user);
       expect(others).toHaveLength(1);
-      expect(all.find(y => y.user === others[0])!.tier).toBe(x.tier);
+      expect(all.find(y => y.user === others[0])!.band).toBe(x.band);
     }
   });
 
@@ -564,66 +558,10 @@ describe('leave_matchmaking', () => {
   });
 });
 
-// ── tier widening ───────────────────────────────────────────────────────
-
-describe('tier widening', () => {
-  it('only pairs neighbouring tiers once both sides have waited, via the heartbeat, and never two tiers apart', async () => {
-    const beginner = await createUser(db, { tier: 'beginner' });
-    const intermediate = await createUser(db, { tier: 'intermediate' });
-    const advanced = await createUser(db, { tier: 'advanced' });
-
-    const rb = await enter(beginner, { stake: 100, exercise: 'plank' });
-    await ageLobby(rb.challenge_id!, 60);
-
-    // A fresh intermediate is not dropped into the aged lobby: they have
-    // not waited themselves.
-    const ri = await enter(intermediate, { stake: 100, exercise: 'plank' });
-    expect(ri.status).toBe('searching');
-    expect(ri.challenge_id).not.toBe(rb.challenge_id);
-
-    // Before their own 45 s, a beat changes nothing.
-    expect((await beat(intermediate, ri.id)).challenge_id).toBe(ri.challenge_id);
-
-    // The advanced fighter has waited long enough, but is two tiers away.
-    const ra = await enter(advanced, { stake: 100, exercise: 'plank' });
-    await ageLobby(ra.challenge_id!, 60);
-    expect((await beat(advanced, ra.id)).status).toBe('searching');
-    expect((await queueRow(ra.id))!.challenge_id).toBe(ra.challenge_id);
-
-    // Once the intermediate has waited too, their beat moves them in and
-    // fills the bout.
-    await ageLobby(ri.challenge_id!, 60);
-    const moved = await beat(intermediate, ri.id);
-    expect(moved.status).toBe('matched');
-    expect(await participantsOf(moved.match_id!)).toEqual([beginner, intermediate].sort());
-    expect(await queueRow(rb.id)).toMatchObject({ status: 'matched', match_id: moved.match_id });
-    expect(await challengeStatus(ri.challenge_id!)).toBeNull();
-    await leave(advanced, ra.id);
-  });
-
-  it('keeps a widened group lobby within one tier of every member', async () => {
-    const [b1, b2] = await users(2, 'beginner');
-    const inter = await createUser(db, { tier: 'intermediate' });
-    const adv = await createUser(db, { tier: 'advanced' });
-    const lobby = await enter(b1!, { format: 'pooled', seats: 4, stake: 250 });
-    await enter(b2!, { format: 'pooled', seats: 4, stake: 250 });
-    await ageLobby(lobby.challenge_id!, 60);
-
-    const ri = await enter(inter, { format: 'pooled', seats: 4, stake: 250 });
-    await ageLobby(ri.challenge_id!, 60);
-    const movedIn = await beat(inter, ri.id);
-    expect(movedIn.challenge_id).toBe(lobby.challenge_id);
-    expect(movedIn.lobby_size).toBe(3);
-
-    // Advanced is one tier from the intermediate but two from the
-    // beginners: not admitted.
-    const ra = await enter(adv, { format: 'pooled', seats: 4, stake: 250 });
-    await ageLobby(ra.challenge_id!, 60);
-    const stayed = await beat(adv, ra.id);
-    expect(stayed.challenge_id).toBe(ra.challenge_id);
-    expect(stayed.status).toBe('searching');
-  });
-});
+// Tier widening is gone: _mm_tier_rank() and _mm_tier_widen_after() were
+// dropped by 20260909000000 and the queue widens an MMR window instead.
+// The replacement tests live in __tests__/skillRating.db.test.ts under
+// "MMR widening", where a fighter can be given a placed rating.
 
 // ── filling edge cases ──────────────────────────────────────────────────
 
@@ -745,13 +683,19 @@ describe('settle_match for N seats', () => {
     for (const u of all.members) {
       expect(await balance(db, u)).toBe(500);
     }
-    // A fresh settle after the fact still classifies the same way.
+    // A fresh settle after the fact still classifies the same way. Undoing
+    // a settlement by hand means undoing ALL of it: the payout rows, the
+    // balances and the rating events, whose (user, match) uniqueness is
+    // deliberately strict enough to refuse a second rating otherwise. See
+    // BACKEND.md, "Re-settling by hand".
     await db.pool.query('UPDATE matches SET settled_at = NULL WHERE id = $1', [all.matchId]);
     await db.pool.query("DELETE FROM points_ledger_entries WHERE match_id = $1 AND reason = 'payout'", [all.matchId]);
+    await db.pool.query('DELETE FROM skill_rating_events WHERE match_id = $1', [all.matchId]);
     await db.pool.query('UPDATE fitness_profiles SET points_balance = 400 WHERE user_id = ANY($1)', [all.members]);
     expect(await settle(all.members[0]!, all.matchId)).toBe('tie_refunded');
     await db.pool.query('UPDATE matches SET settled_at = NULL WHERE id = $1', [matchId]);
     await db.pool.query("DELETE FROM points_ledger_entries WHERE match_id = $1 AND reason = 'payout'", [matchId]);
+    await db.pool.query('DELETE FROM skill_rating_events WHERE match_id = $1', [matchId]);
     expect(await settle(loser, matchId)).toBe('tie_split');
   });
 

@@ -84,6 +84,8 @@ function queueRow(over: Partial<MatchmakingQueueRow> = {}): MatchmakingQueueRow 
     max_participants: 2,
     stake_points: 250,
     strength_tier: 'beginner',
+    mmr: 1000,
+    placement_complete: false,
     status: 'searching',
     challenge_id: 'lobby-1',
     match_id: null,

@@ -79,10 +79,164 @@ enum LedgerReason {
   bonus
 }
 
+/// Derived from SkillRating.mmr by the rank_tier_for() SQL function, never
+/// stored on the rating itself. Ascending. "Unranked" is not a value here:
+/// it is how the client renders a rating with placementComplete = false.
+enum RankTier {
+  commoner
+  squire
+  knight
+  hero
+  sovereign
+  ultimate_champion
+}
+
+/// Binary because that is the shape of every source table
+/// performance_norms / race_standards were seeded from (ACSM, Chase et al.,
+/// the wall-sit numbers, WMA's age factors) -- a limitation of the source
+/// data, not a claim that only two genders exist. Optional on
+/// FitnessProfile; anyone who doesn't select one gets the population-median
+/// MMR seed like anyone who leaves any other optional field blank. See
+/// BACKEND.md, "Real-world percentile seeding".
+enum Gender {
+  male
+  female
+}
+
+/// One unified age-band scheme reused by every exercise's decline model,
+/// even though each source table's own baseline age range differs slightly
+/// (pushups/wallsit: 20-29; plank: 18-25). Representative (midpoint) ages
+/// are defined once in _age_band_representative_age() in the migration.
+/// under_20 has no source data in any of the four exercises and defaults
+/// to the youngest sourced band rather than an invented youth adjustment.
+enum AgeBand {
+  under_20
+  twenties  @map("20s")
+  thirties  @map("30s")
+  forties   @map("40s")
+  fifties   @map("50s")
+  sixties   @map("60s")
+  seventy_plus @map("70_plus")
+}
+
+/// Seed reference data mapping raw performance -> percentile -> initial
+/// MMR, per (exercise_type, gender, age_band). NOT user data and not
+/// user-editable -- no client grant exists on this table at all; it is
+/// consulted only from inside _mmr_seed_from_norms() (SECURITY DEFINER,
+/// transitively via settle_match()). Confidence is graded per exercise
+/// type in BACKEND.md exactly: pushups=high, plank=high-narrow,
+/// wallsit=low. See 20260910000000_performance_norms/migration.sql for
+/// the full sourcing and decline-rate notes behind every row.
+model PerformanceNorm {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  exerciseType ChallengeType @map("exercise_type")
+  gender       Gender
+  ageBand      AgeBand       @map("age_band")
+  /// 0..100 exclusive. Sourced directly for plank (Chase et al.); an
+  /// assumed even-split boundary/centre for pushups/wallsit's ordinal
+  /// categories -- see the migration for exactly which is which.
+  percentile   Decimal       @db.Decimal
+  /// Reps (pushups) or seconds (plank, wallsit), already age-adjusted for
+  /// this ageBand.
+  rawValue     Decimal       @map("raw_value") @db.Decimal
+  confidence   String
+  source       String
+
+  @@unique([exerciseType, gender, ageBand, percentile])
+  @@index([exerciseType, gender, ageBand])
+  @@map("performance_norms")
+}
+
+/// Reference data for race age-grading. Shaped for WMA-style grading
+/// (a standard time per distance/gender) rather than a percentile table.
+/// ONLY 'mile' is seeded -- the one race distance FittrApp defines
+/// (EXERCISE_LABEL.race = "1-Mile Race"). NOT WMA's own published
+/// age-standard data -- see BACKEND.md, "Race / WMA age-grading": these
+/// are clearly-flagged placeholders, confidence=low, pending real WMA
+/// tables before use beyond a rough placement seed.
+model RaceStandard {
+  id               String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  distance         String
+  gender           Gender
+  standardSeconds  Decimal @map("standard_seconds") @db.Decimal
+  confidence       String
+  source           String
+
+  @@unique([distance, gender])
+  @@map("race_standards")
+}
+
+/// One skill rating per (user, exercise type). MMR is plain Elo, updated
+/// inside settle_match() as part of settlement; K is 100 for the first five
+/// bouts in an exercise and 32 after. Written only by SECURITY DEFINER
+/// functions and readable by its owner alone — the app reads the
+/// `my_skill_ratings` view (not modeled here; Prisma does not manage views)
+/// so the tier bands are applied by the database. placementComplete is kept
+/// equal to (matchesPlayed >= 5) by a trigger, so it is a cached derivation
+/// rather than a second source of truth. See BACKEND.md, "Skill rating".
+model SkillRating {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId            String        @map("user_id") @db.Uuid
+  exerciseType      ChallengeType @map("exercise_type")
+  mmr               Int           @default(1000)
+  matchesPlayed     Int           @default(0) @map("matches_played")
+  /// matchesPlayed >= 5. Trigger-maintained; do not set it by hand.
+  placementComplete Boolean       @default(false) @map("placement_complete")
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime      @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([userId, exerciseType])
+  @@index([userId])
+  @@map("skill_ratings")
+}
+
+/// What one settled bout did to one fighter's rating: the audit trail for
+/// SkillRating, and the Results screen's source for "+18" / "−24". One row
+/// per rated participant per match, written inside settle_match(). The
+/// (userId, matchId) uniqueness makes a double rating write impossible even
+/// if settlement's settledAt guard were ever weakened — which also means an
+/// operator undoing a settlement by hand must delete these rows too.
+model SkillRatingEvent {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String        @map("user_id") @db.Uuid
+  matchId        String        @map("match_id") @db.Uuid
+  match          Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  exerciseType   ChallengeType @map("exercise_type")
+  mmrBefore      Int           @map("mmr_before")
+  mmrAfter       Int           @map("mmr_after")
+  /// mmrAfter - mmrBefore, i.e. after the rating floor is applied.
+  delta          Int
+  /// 100 during placement, 32 after.
+  kFactor        Int           @map("k_factor")
+  /// Whether the rating was still placing when this bout STARTED.
+  wasPlacement   Boolean       @map("was_placement")
+  /// matchesPlayed after this bout.
+  matchesPlayed  Int           @map("matches_played")
+  /// Seats on the bout; the group divisor is this minus one.
+  participants   Int
+  /// True only on a fighter's first-ever rated bout in this exercise, and
+  /// only when it actually used the real-world percentile seed (both
+  /// gender and ageBand were on file) instead of the flat 1000 default.
+  /// See 20260910000000_performance_norms, "Real-world percentile seeding".
+  normsSeeded    Boolean       @default(false) @map("norms_seeded")
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([userId, matchId])
+  @@index([userId])
+  @@index([matchId])
+  @@map("skill_rating_events")
+}
+
 /// Self-reported strength tier + points balance, one row per Supabase auth
 /// user. Created lazily on first login by the app (see
 /// src/hooks/useFitnessProfile.ts). userId references auth.users(id) via a
 /// raw FK in the migration SQL, not a Prisma relation — see the note above.
+///
+/// strengthTier is NOT what matchmaking pairs on: since 20260909000000 the
+/// queue pairs on SkillRating.mmr for the exercise being queued. The column
+/// stays as a display and onboarding field — what a fighter says about
+/// themselves before they have a record — and is still client-writable,
+/// which is exactly why it could never be the matchmaking signal.
 model FitnessProfile {
   id            String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId        String       @unique @map("user_id") @db.Uuid
@@ -95,6 +249,14 @@ model FitnessProfile {
   username      String?      @unique @db.Citext
   /// Public URL in the `avatars` storage bucket.
   avatarUrl     String?      @map("avatar_url")
+  /// Optional, self-reported. Neither this nor ageBand is required to
+  /// play; missing either falls back to the population-median MMR seed
+  /// during placement rather than blocking anything. Set only through
+  /// update_my_profile() (p_gender). See BACKEND.md, "Real-world
+  /// percentile seeding".
+  gender        Gender?
+  /// Optional, self-reported. See gender above.
+  ageBand       AgeBand?     @map("age_band")
   createdAt     DateTime     @default(now()) @map("created_at")
   updatedAt     DateTime     @default(now()) @map("updated_at") @db.Timestamptz(6)
 
@@ -167,8 +329,14 @@ model MatchmakingQueueEntry {
   format          ChallengeFormat
   maxParticipants Int               @map("max_participants")
   stakePoints     Int               @map("stake_points")
-  /// Tier at the moment of entry.
+  /// Self-reported tier at the moment of entry. Display only: nothing in
+  /// _mm_find_lobby() has read it since 20260909000000.
   strengthTier    StrengthTier      @map("strength_tier")
+  /// Rating for this exercise at entry, and whether it was placed. The
+  /// snapshot the pairing predicate actually reads, taken at entry so a
+  /// bout settling elsewhere cannot re-band a live search.
+  mmr             Int               @default(1000)
+  placementComplete Boolean         @default(false) @map("placement_complete")
   status          MatchmakingStatus @default(searching)
   /// The lobby this entry is provisionally seated in.
   challengeId     String?           @map("challenge_id") @db.Uuid
@@ -216,6 +384,7 @@ model Match {
   participants  MatchParticipant[]
   ledgerEntries PointsLedgerEntry[]
   queueEntries  MatchmakingQueueEntry[]
+  ratingEvents  SkillRatingEvent[]
 
   @@map("matches")
 }

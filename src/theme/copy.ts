@@ -1,7 +1,9 @@
 import type {
+  AgeBand,
   ChallengeFormat,
   ChallengeStatus,
   ChallengeType,
+  Gender,
   LedgerReason,
   NotificationPrefs,
   StrengthTier,
@@ -87,9 +89,24 @@ export const STATUS_LABEL: Record<ChallengeStatus, string> = {
 };
 
 /**
- * The design names tiers Bronze / Silver / Gold / Elite. The database enum
- * has three values, so Elite is not reachable until the enum grows; the
- * three that exist map onto the first three medals.
+ * Exercises that carry a skill rating: the three camera verification (and
+ * therefore settlement, and therefore MMR) supports. Same set as
+ * VERIFIABLE_TYPES, as an ordered list for the Profile screen's rank rows.
+ */
+export const RANKED_TYPES: readonly ChallengeType[] = [
+  'pushups',
+  'plank',
+  'wallsit',
+];
+
+/**
+ * The SELF-REPORTED tier, named Bronze / Silver / Gold. The database enum
+ * has three values, so the design's Elite is not reachable until it grows.
+ *
+ * This is no longer what matchmaking pairs on -- see src/lib/skillRating.ts
+ * and the six earned RankTier bands. It stays as what a fighter says about
+ * themselves before they have a record, and it is still what onboarding
+ * asks for.
  */
 export const TIER_LABEL: Record<StrengthTier, string> = {
   beginner: 'Bronze',
@@ -113,6 +130,27 @@ export const TIERS: readonly StrengthTier[] = [
   'beginner',
   'intermediate',
   'advanced',
+];
+
+export const GENDER_LABEL: Record<Gender, string> = {
+  male: 'Male',
+  female: 'Female',
+};
+
+export const GENDERS: readonly Gender[] = ['male', 'female'];
+
+export const AGE_BAND_LABEL: Record<AgeBand, string> = {
+  under_20: 'Under 20',
+  '20s': '20s',
+  '30s': '30s',
+  '40s': '40s',
+  '50s': '50s',
+  '60s': '60s',
+  '70_plus': '70+',
+};
+
+export const AGE_BANDS: readonly AgeBand[] = [
+  'under_20', '20s', '30s', '40s', '50s', '60s', '70_plus',
 ];
 
 export const LEDGER_LABEL: Record<LedgerReason, string> = {

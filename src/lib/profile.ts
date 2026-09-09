@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import type { FitnessProfileRow } from '../types/database';
+import type { AgeBand, FitnessProfileRow, Gender } from '../types/database';
 
 /**
  * Profile identity: display name, unique @username, avatar URL. Validation
@@ -58,6 +58,15 @@ export interface ProfilePatch {
   username?: string;
   /** undefined = unchanged, '' = clear. */
   avatarUrl?: string;
+  /**
+   * undefined = unchanged. No clear path from the client -- these are
+   * fixed-choice pickers, not free text; there is no "clear" affordance in
+   * the UI, only "pick a different one." Optional forever either way: a
+   * profile that never sets either just keeps getting the population-
+   * median MMR seed during placement.
+   */
+  ageBand?: AgeBand;
+  gender?: Gender;
 }
 
 const ERROR_COPY: Record<string, string> = {
@@ -85,6 +94,8 @@ export async function updateMyProfile(patch: ProfilePatch): Promise<FitnessProfi
     p_display_name: patch.displayName ?? null,
     p_username: patch.username !== undefined ? normalizeUsername(patch.username) : null,
     p_avatar_url: patch.avatarUrl ?? null,
+    p_age_band: patch.ageBand ?? null,
+    p_gender: patch.gender ?? null,
   });
   if (error) {
     throw new Error(humanizeProfileError(error.message));

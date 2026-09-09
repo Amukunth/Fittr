@@ -274,6 +274,12 @@ The gate tests `anomaly_flag AND NOT reviewed`, which is what gives
 then `settle_match()` runs again and pays out normally. There is no client
 policy on that column, by design.
 
+**Superseded twice since.** `20260908000000_live_matchmaking_queue`
+generalised all of the above to N seats (see "Settlement for N seats"), and
+`20260909000000_skill_ratings` added the MMR update inside the same function
+(see "Skill rating"). The rules in this section still describe how a *winner*
+is chosen; the payout and rating details below it are the 2-seat originals.
+
 **Where it runs from:** inline at the end of `submit_verification_session()`,
 in the same transaction, so the match settles the instant the second result
 lands without any client involvement. A client that submits and then dies
@@ -503,6 +509,22 @@ machine before the CLI's engine binaries will be present.
 - `src/screens/SearchingScreen.tsx` — the live queue screen.
 - `test/dbHarness.ts`, `test/pgServer.mjs` — embedded Postgres for
   `__tests__/matchmaking.db.test.ts`.
+- `prisma/migrations/20260909000000_skill_ratings/migration.sql` — the
+  `skill_ratings` / `skill_rating_events` tables, `rank_tier_for()`, the
+  `my_skill_ratings` view, `_mmr_rate_match()`, and the rewrites of
+  `settle_match()`, `_mm_find_lobby()`, `enter_matchmaking()` and
+  `matchmaking_heartbeat()`. See "Skill rating" below.
+- `src/lib/skillRating.ts` — the client half of ratings: the tunables
+  mirrored from that migration, the tier labels and colours, and the display
+  rules for Profile and Results.
+- `src/hooks/useSkillRatings.ts` — reads the `my_skill_ratings` view.
+- `prisma/migrations/20260910000000_performance_norms/migration.sql` —
+  `performance_norms` / `race_standards` seed tables, `gender`/`age_band`
+  on `fitness_profiles`, `_mmr_from_percentile()`,
+  `_perf_percentile_from_anchors()`, `_mmr_seed_from_norms()`, the race
+  age-grading pipeline, the `_mmr_rate_match()` rewrite that seeds a
+  fighter's first rated bout from it, and `update_my_profile()` extended
+  with `p_age_band`/`p_gender`. See "Real-world percentile seeding" below.
 - `src/lib/holdTracker.ts` — `QuickPoseHoldTracker`, the hold-duration
   analogue of the SDK's rep counter. Unit-tested in
   `__tests__/holdTracker.test.ts`; it takes an injected clock precisely so it
@@ -692,6 +714,13 @@ optimisation rather than a correctness requirement — which matters, because
 Realtime has no replay.
 
 ### Tier widening
+
+> **Superseded by `20260909000000_skill_ratings` (see "Matchmaking on MMR").**
+> `_mm_tier_rank()` and `_mm_tier_widen_after()` no longer exist, and
+> `strength_tier` gates nothing. The two judgment calls below — widening is
+> symmetric, and admission is pairwise rather than lobby-wide — were both
+> carried over verbatim into the MMR window, which is why they are still
+> worth reading. Everything else here is history.
 
 A lobby starts same-tier. After **45 seconds** it may pair one tier apart —
 never two, so a beginner never meets an advanced fighter. Two judgment calls:
@@ -926,8 +955,8 @@ underlying gap is unchanged and will recur on the next abandoned bout.
   half-filled lobby with no live viewers can sit until swept. Starting short
   after a timeout, or hard-expiring the lobby row itself, remain unbuilt
   product calls.
-- **Stake is never widened**, only tier is. Matching across stakes would need
-  a rule for what the pot is.
+- **Stake is never widened**, only the rating window is (tier, when this was
+  written). Matching across stakes would need a rule for what the pot is.
 - **No push notifications.** Unchanged from before: a backgrounded app is not
   reachable, which is why the TTL exists at all.
 
@@ -969,6 +998,325 @@ The single highest-value manual test: **two accounts, both on Find a Bout,
 same exercise and stake, tapping within a second of each other.** Both should
 land in the camera together, each having lost exactly one stake, with one
 `matches` row and two `match_participants`.
+
+## Skill rating: per-exercise MMR and the six rank tiers (2026-09-09)
+
+Migration `20260909000000_skill_ratings`. Replaces self-reported
+`fitness_profiles.strength_tier` as the signal the live queue pairs on. The
+column stays — it is what a fighter says about themselves before they have a
+record, and onboarding still asks for it — but **nothing in
+`_mm_find_lobby()` reads it any more**, and `_mm_tier_rank()` /
+`_mm_tier_widen_after()` were dropped so no future function can pick it up
+believing it still means something.
+
+### Why tier could never have been the real signal
+
+`strength_tier` is client-writable: the Profile screen sets it with a plain
+`UPDATE fitness_profiles`, and the column grant that allows it predates all
+of this. Anyone who wanted an easier bout could declare themselves a
+beginner between searches. It also has three values for a whole account,
+which says nothing about whether someone who can do 40 push-ups can also
+hold a plank. MMR is per `(user, exercise_type)`, is written only inside
+settlement, and has no client write path at all.
+
+### The tables
+
+`skill_ratings` — one row per `(user_id, exercise_type)`: `mmr`,
+`matches_played`, `placement_complete`. Created on demand by
+`enter_matchmaking()` when a fighter first queues an exercise, and by
+`settle_match()` for anyone who somehow reaches settlement without one.
+Select-own RLS, `GRANT SELECT` only.
+
+`skill_rating_events` — one row per rated participant per settled bout:
+`mmr_before`, `mmr_after`, `delta`, `k_factor`, `was_placement`,
+`matches_played`, `participants`. The Results screen's source for "+18", and
+the audit trail that makes `seed + sum(delta) = mmr` checkable. Same shape as
+`points_ledger_entries` next to `fitness_profiles.points_balance`, and for
+the same reason: a current value you can read cheaply, plus the history that
+explains it.
+
+`my_skill_ratings` — a `security_invoker` view over `skill_ratings` adding
+`rank_tier` (from `rank_tier_for()`) and `placement_bouts`. This is what the
+app reads, so the band edges are applied by the database and the client never
+has to agree with SQL about where Knight starts. **`security_invoker = true`
+is load-bearing**: a plain view runs as its owner and would have handed every
+fighter the whole table.
+
+`placement_complete` is stored but is *not* an independent fact — a
+`BEFORE INSERT OR UPDATE` trigger pins it to
+`matches_played >= _mmr_placement_bouts()` whatever wrote the row. It is
+stored only so the matchmaking predicate and the queue snapshot can be plain
+column reads.
+
+### The tier bands
+
+Six evenly-sized **200-point bands over a nominal 900–1900 range**, with the
+outermost two open-ended because Elo has no ceiling or floor:
+
+| Tier | MMR |
+| --- | --- |
+| Commoner | below 900 |
+| Squire | 900 – 1099 |
+| Knight | 1100 – 1299 |
+| Hero | 1300 – 1499 |
+| Sovereign | 1500 – 1699 |
+| Ultimate Champion | 1700 and above |
+
+`rank_tier_for(integer)` is the only definition. `src/lib/skillRating.ts`
+mirrors the table for one purpose — deriving a tier from a
+`skill_rating_events` row, which carries the MMR but not the band — and
+`__tests__/skillRating.db.test.ts` asserts the mirror against the SQL
+function at every 25 points from 0 to 2200, so the two cannot drift.
+
+**The seed is 1000, which is the dead centre of Squire, not the middle of the
+scale.** Two reasons. A fighter with no record should sit low enough that
+early wins visibly move them, rather than starting halfway up. And Commoner
+has to be *reachable*: seeding into Knight or Hero would make the bottom band
+a place nobody is ever in, which is a tier that exists only on the marketing
+page. At K=32 a win over an equal opponent is +16, so roughly twelve net wins
+crosses a band — slow enough to mean something, fast enough to see.
+
+**"Unranked" is not a stored tier.** It is how the client renders a rating
+whose `placement_complete` is false. The row always carries a `rank_tier`
+(derived from the seed), and the Profile screen deliberately withholds it
+until placement finishes: showing "Squire" to someone who has fought once
+would assert exactly the thing the five placement bouts exist to find out.
+
+### K-factor and placement
+
+| Condition | K |
+| --- | --- |
+| `matches_played < 5` for that exercise type | **100** |
+| `matches_played >= 5` | **32** |
+
+K is per fighter, not per bout. A fighter placing at K=100 can meet an
+opponent moving at K=32 in the same bout, and they will move by different
+amounts. **MMR is therefore not zero-sum and is not reconciled the way the
+points ledger is** — that is a property of the K schedule, not a bug to fix.
+
+Placement is per exercise type too: five bouts of push-ups place a push-up
+rating and leave a plank rating untouched at the seed.
+
+A **floor of 100** is applied after the delta. Standard Elo is unbounded
+downward; from the seed at K=32 the floor is unreachable in practice, and it
+exists only so a pathological run cannot produce a negative rating the tier
+bands and the UI have no reading for. The clamp is applied *before*
+`skill_rating_events` is written, and the event records the **effective**
+delta, so what the Results screen shows is always the change that actually
+happened.
+
+### The Elo itself
+
+Standard, with no margin-of-victory weighting (see "Deliberately not built"):
+
+```
+E_A = 1 / (1 + 10^((R_B - R_A) / 400))
+R_A' = R_A + K * (S_A - E_A)
+```
+
+`numeric` throughout, so the pairwise sums in a six-seat bout are exact until
+a single `round()` at the end (round-half-away-from-zero). The exponent is
+clamped to ±10 — a 4000-point gap, far beyond anything reachable — because
+`power()` on numeric raises rather than saturating, and a rating table
+corrupted by some future bug must not be able to make *settlement* throw.
+
+### Group Battles: pairwise decomposition, divided by (N−1)
+
+A bout with N seats is decomposed into all N(N−1)/2 pairwise comparisons of
+the final ranking. For each ordered pair (i, j):
+
+- `S_ij` = 1 if i outscored j, **0.5 if they tied**, 0 if j outscored i
+- `raw_i += K_i * (S_ij - E_ij)`
+
+and then **every fighter's total is divided by (N−1)** before rounding.
+Without the divisor a six-seat bout would move a rating five times as far as
+a 1v1 for the same relative performance, which would make Group Battles the
+only rational way to climb. With it, the top and bottom of a four-way move
+exactly as far as a 1v1 winner and loser do (±16 between equals at K=32),
+which the db test asserts directly.
+
+Two consequences worth stating:
+
+- **Every E_ij uses the ratings as they were when the bout started.** The
+  arrays are read once, up front, and never updated inside the loop, so the
+  result does not depend on the order pairs are visited. A
+  sequentially-updating implementation would give a different (and
+  order-dependent) answer; `__tests__/skillRating.db.test.ts` pins this with
+  a mixed-rating three-way whose expectations are computed from the starting
+  ratings only.
+- **Second place is not "not the winner".** Second of four still beat two
+  people and gains; third still lost to two and drops. Only the pairwise
+  decomposition gets this right.
+
+### Where it runs: inside settlement, not beside it
+
+`_mmr_rate_match()` is called from `settle_match()` — **after** the anomaly
+gate, **after** the pot has moved, and **before** `settled_at` is stamped.
+That position is the whole design:
+
+- a bout that returns `needs_review` rates nothing, and rates normally on the
+  later call that clears the review;
+- a bout that returns `already_settled` rates nothing, because it returns
+  before reaching the call — the `settled_at` guard is what makes the rating
+  write exactly-once, the same guard that makes the payout exactly-once;
+- a rating write that fails takes the whole settlement down with it. That is
+  the same bargain `submit_verification_session()` already makes with
+  settlement itself: a paid-out bout with no rating would be silently wrong,
+  and unrecoverable without knowing the pre-bout ratings.
+
+Because settlement already runs inline at the end of
+`submit_verification_session()`, ratings update the instant the last result
+lands, with no client involvement and no separate step a modified build could
+skip.
+
+### Lock order
+
+`20260908000000` fixed one order for every function that can run
+concurrently: lobby `challenges` row → member `matchmaking_queue` rows →
+`fitness_profiles` rows `ORDER BY user_id`. **`skill_ratings` is appended to
+the end of that chain**: `settle_match()` takes its rating rows
+`FOR UPDATE ORDER BY user_id` only after it has finished with
+`fitness_profiles`.
+
+Nothing else takes a rating row lock at all. `enter_matchmaking()` ensures
+its row with `INSERT ... ON CONFLICT DO NOTHING` — which never waits on a
+*committed* conflicting row — and then reads it unlocked, before it takes the
+domain advisory lock. So a fighter entering the queue can never block, or be
+blocked by, a bout settling underneath them. **Do not add a `FOR UPDATE` to
+that read.**
+
+### Matchmaking on MMR
+
+`matchmaking_queue` gained `mmr` and `placement_complete`, snapshotted at
+entry for the same reason `strength_tier` was: the pairing predicate must not
+read a value that can move under a live search. (The client cannot write this
+one, but a bout settling elsewhere can.) `strength_tier` stays on the row,
+unread by any predicate.
+
+**The rule, in full.** A lobby fits a fighter when it is in the same domain
+(exercise, format, seats) at the same stake and has a free seat, *and* for
+every member `m` currently seated in it:
+
+- if **either** `m` or the arriving fighter is still in placement, that pair
+  is compatible — **full stop, no rating comparison is made at all**;
+- otherwise `abs(m.mmr - fighter.mmr)` must be within the window: **150**, or
+  **400** once *both* the lobby and the fighter have waited **45 seconds**.
+
+**What "broadly" means during placement, precisely: rating is ignored
+entirely, and matching falls back to availability alone** — exercise, format,
+seats and stake, which are what the fighter explicitly asked for and cannot
+be wrong about. An unplaced rating is a seed, not a measurement: it says
+"1000" about someone we have never seen lift. Gating on it would be gating on
+a number that does not exist yet, and worse, it would herd every new fighter
+into the same narrow band as every other new fighter regardless of actual
+ability. K=100 is the other half of the trade: five bouts against a wide
+field move a placing rating far enough to land near the truth, which is what
+makes the narrow window meaningful once it does apply.
+
+This is deliberately **asymmetric-tolerant**: *one* unplaced fighter opens
+the pair up even if the other is placed, so a placed Sovereign can be handed
+an unplaced newcomer. That is the intended direction — the newcomer needs a
+hard reference point to place against, and the veteran's rating barely moves
+for a win they were expected to take.
+
+The check stays **pairwise rather than lobby-wide**, kept from the tier
+version and mattering more here: without it a six-seat lobby could accumulate
+a 900 and a 1500 by admitting each of them next to a 1200. Widening is still
+**symmetric** — both the lobby and the arriving fighter must have waited the
+45 seconds — so nobody is widened before they have queued for it themselves,
+and the heartbeat retry is what pairs two patient neighbours.
+
+### Display
+
+**Profile** shows one row per ranked exercise (push-ups, plank, wall-sit) —
+not a single combined rank, because the ratings are genuinely independent.
+Three states, and they are not the same thing: never fought (no rating row),
+placing ("Unranked" + "3 of 5 placement bouts"), and placed (the tier name,
+the MMR, and a bar showing progress through the band). The self-reported
+Bronze/Silver/Gold pill stays in the header, and its bottom sheet no longer
+claims to set "who you get matched with" — that copy became false the moment
+this shipped, and leaving it would be the worst kind of stale string.
+
+**Results** shows the MMR change once placed ("+18", "−24") and **no number
+at all during placement**. At K=100 a single placement bout can swing 100
+points; shown as a number, that reads as wild instability rather than as the
+system finding a fighter's level, especially across a +100 followed by a
+−100. During placement the line carries progress instead
+("PLACEMENT · 2 OF 5 · 3 TO GO"), and the bout that completes placement
+announces the tier that landed ("PLACED · HERO"). RLS scopes
+`skill_rating_events` to the caller, so an opponent's rating is never on the
+wire.
+
+### Re-settling by hand
+
+The legitimate re-settle path — a `needs_review` bout whose review clears —
+never wrote a rating event, because `needs_review` returns before rating. It
+just works.
+
+An operator who instead **unsets `matches.settled_at` to force a re-settle
+must also delete that match's `skill_rating_events` rows**, exactly as they
+already have to reverse the `payout` ledger rows and the balances. The
+`(user_id, match_id)` unique constraint will otherwise refuse the second
+rating and abort the whole settlement — loudly, which is the intended
+behaviour and much better than double-rating a bout. This was found by an
+existing test that resets `settled_at` to check the return-value
+classification; that test now clears the rating events too.
+
+### Deliberately not built
+
+- **Margin-of-victory weighting.** A 40-rep win over 39 moves a rating
+  exactly as much as 40 over 5. Elo is a model of *who beats whom*, and
+  folding in margin needs a defensible per-exercise scale (is 10 extra reps
+  worth the same as 30 extra seconds of plank?) plus a rule for what stops a
+  sandbagger from farming huge margins against weak opponents. A future pass,
+  explicitly out of scope for this one.
+- **Rating decay.** A rating earned in March still stands in September.
+- **Cross-exercise inference.** Being a Hero at push-ups says nothing about
+  your plank, by construction.
+- **A leaderboard.** `skill_ratings` is select-own; ranking players against
+  each other publicly is a product decision with its own privacy shape.
+- **Stake is still never widened**, only the rating window is. Matching
+  across stakes would need a rule for what the pot is. Unchanged from before.
+- **The MMR window never becomes unbounded.** It stops at ±400, exactly as
+  tier widening never went two tiers. On a small user base, two placed
+  fighters more than 400 apart in the same domain and stake will not meet,
+  and both will time out. This is the same known limitation the tier rule
+  had, in a new coordinate system.
+
+### ⚠️ What is NOT verified about ratings
+
+`__tests__/skillRating.db.test.ts` (35 tests) runs the real migration SQL
+against a real embedded Postgres: the band boundaries, the K schedule across
+six consecutive bouts fought through the live queue, the pairwise group
+decomposition against hand-computed expectations, the (N−1) divisor, ties
+inside a field, the review gate, the floor clamp, exactly-once rating under
+repeated settlement, and the pairing and widening rules.
+`__tests__/skillRating.test.ts` (16 tests) covers the display rules with no
+database.
+
+**None of it exercises a real bout.** These need real accounts on real
+devices and cannot be confirmed by reading code:
+
+1. **A real settlement moving a real rating**, through PostgREST rather than
+   a `pg` connection. Every arithmetic test stages its bout by inserting the
+   challenge/match/participant rows directly — deliberately, because the
+   rating maths has to be testable at spreads the queue would never pair.
+   Only the K-schedule test fights through `enter_matchmaking()` end to end.
+2. **Two placed fighters actually failing to meet**, and then meeting after
+   the 45-second widening, on real phones with real heartbeats. The window
+   arithmetic is proven in SQL; the wall-clock behaviour is not.
+3. **The Profile and Results screens rendering a real rating.** They
+   typecheck and their pure functions are unit-tested, but no test mounts
+   them against a live `my_skill_ratings` / `skill_rating_events` read. In
+   particular **the `my_skill_ratings` view has never been read through
+   PostgREST** — `security_invoker` views are exposed like tables, but that
+   is asserted here from the migration, not observed. If Profile shows no
+   ranks at all after deploy, that read is the first thing to check.
+4. **Whether the numbers feel right.** Whether 5 placement bouts is enough,
+   whether ±150 is too tight for the real user base, and whether crossing a
+   band in ~12 net wins is satisfying are empirical product questions. All
+   four are single-value tunable functions in the migration precisely so they
+   can be changed without touching any logic.
 
 ### Testing: embedded Postgres
 
@@ -1017,3 +1365,304 @@ broken search" above; the migration itself moved no points.
 Because the old build inserts challenges it no longer has the grant for, a
 migration and its EAS build ship together: commit → push → `npm run
 db:deploy` → `eas build` → install. See the README loop.
+
+### ⚠️ Deploy status: `20260909000000_skill_ratings` is NOT applied
+
+Written and tested locally on 2026-09-09; **not yet run against the live
+Supabase project**, and no EAS build carries the client half. Until
+`npm run db:deploy` runs, the live database still pairs on `strength_tier`
+and has no `skill_ratings` table — so a build containing these screens would
+fail its `my_skill_ratings` read. Migration and build ship together, as
+always: commit → push → `npm run db:deploy` → `eas build` → install.
+
+Two things to check by hand immediately after deploying, both called out
+under "What is NOT verified about ratings": that `my_skill_ratings` is
+readable through PostgREST (Profile shows rank rows rather than nothing), and
+that a real settled bout writes a `skill_rating_events` row.
+
+## Real-world percentile seeding (2026-09-10)
+
+Migration `20260910000000_performance_norms`. Placement-only. Standard Elo
+— `_mmr_expected()`, K=100/32, the group `(N-1)` divisor, the rating floor —
+is **completely unchanged**. This migration changes exactly one thing: what
+a fighter's MMR is *before* their very first rated bout in an exercise,
+replacing the flat 1000 seed with a real-world-informed one when it can.
+
+### Confidence, exactly as graded
+
+| Exercise | Confidence | Why |
+| --- | --- | --- |
+| Push-ups | **high** | ACSM norms, a recognised source |
+| Plank | **high-narrow** | Chase et al. 2014 — solid, but only for ages 18–25 |
+| Wall-sit | **low** | Practitioner-sourced, not a published study |
+| Race (WMA) | **high** | WMA age-grading is a well-established *method* — but see the loud caveat below: this migration's actual standard times and age factor are placeholders, not WMA's published tables |
+
+**Do not read the wall-sit numbers, or any exercise's age-decline
+adjustment, as sourced fact at the same weight as the push-up baseline
+itself.** Every row in `performance_norms` carries its own `confidence` and
+`source` text explaining exactly what it is and isn't.
+
+### The shape: a reference table, not a formula buried in code
+
+`performance_norms` — one row per `(exercise_type, gender, age_band,
+percentile)` anchor point: `raw_value`, `confidence`, `source`. Not a
+lookup of a single "your number" — a small ordered set of `(raw_value,
+percentile)` anchors per combination that `_perf_percentile_from_anchors()`
+interpolates between and extrapolates beyond. **No client grant exists on
+this table at all** — `ENABLE ROW LEVEL SECURITY` with no policies (deny
+even to a role with a grant) plus `REVOKE ALL FROM anon, authenticated`,
+the same belt-and-suspenders pattern as `matchmaking_presence`. It's seed
+data, consulted only from inside the SECURITY DEFINER chain.
+
+**How ordinal categories become percentiles.** Chase et al. (plank)
+publishes real percentiles (P25/P50/P75) — those anchors are used
+directly, no assumption layered on. ACSM's push-up categories and the
+wall-sit skill labels are **ordinal with no published percentile
+cutpoints** in the source data given for this feature. Both are converted
+the same documented way: *N* ordinal labels are assumed to be *N* **even**
+population bands (each `100/N`% wide) — but anchored differently depending
+on what the source actually gives:
+
+- Push-ups' bands are **ranges** ("17–29 = average"), so the natural
+  anchors are the **boundaries** between bands: 4 bands (men) → 3
+  boundaries at 25/50/75; 5 bands (women, reproduced exactly as given,
+  including the repeated "above avg" label at 14–22 and 23–31) → 4
+  boundaries at 20/40/60/80.
+- Wall-sit's labels are single **representative times** ("Novice ~45s"),
+  not ranges, so the natural anchor is the **centre** of each assumed
+  25%-wide band: 4 labels → centres at 12.5/37.5/62.5/87.5.
+
+This is **one assumption** (even population splits) applied to two
+differently-shaped inputs, not two different assumptions — but it's still
+an assumption, not sourced fact, and the even-split premise is very
+unlikely to be exactly right (fitness-norm "average" bands are typically
+wider than the extremes in real published tables).
+
+### Age decline, precomputed into the data
+
+Every `raw_value` is **already age-adjusted** for its `age_band` — the
+decline math ran once, at migration-write time, not on every lookup. The
+table is literally the data, auditable as-is with a plain `SELECT`.
+
+- **Push-ups: −4 reps/decade** beyond the 20-29 baseline (the task's own
+  "roughly −3 to −5", midpoint used — an approximation, not sourced
+  per-decade data). Every boundary floors at 1 rep and, where that floor
+  would make two boundaries collide or invert (this happens in the
+  **women's table from the 50s onward**, where the baseline is already
+  low), is nudged to stay at least 1 rep above the previous one. That
+  visible compression is the model straining past where it should be
+  trusted — flagged in the row-level `source` text, not hidden.
+- **Plank: −10%/decade** beyond the 18-25 baseline. **This rate is an
+  analyst estimate** — Chase et al. covers ages 18-25 only and gives no
+  decline rate at all. −10%/decade is a round, conservative approximation
+  in line with general muscular-endurance aging literature, **not a
+  number from the cited paper or any other source**. Needs real sourcing
+  before being trusted past a rough seed.
+- **Wall-sit: no decline at all.** Neither a rate nor an instruction to
+  estimate one was given for wall-sit (unlike push-ups and plank); every
+  age band reuses the 20-29 numbers verbatim. **This is a documented gap,
+  not a finding** that wall-sit endurance doesn't decline with age.
+
+**One unified age-band scheme reused everywhere**, even though each
+exercise's own source baseline spans a slightly different range
+(pushups/wallsit: 20-29; plank: 18-25): `under_20, 20s, 30s, 40s, 50s, 60s,
+70_plus`, mapped to representative (midpoint) ages 17/25/35/45/55/65/75 by
+`_age_band_representative_age()`. `under_20` has no source data in *any* of
+the four exercises and defaults to the youngest sourced band rather than
+inventing a youth adjustment. A side-effect worth naming: plank's `20s`
+band (representative age 25) sits technically *inside* the sourced 18-25
+range, so it still receives a small (~3.6%) decline it arguably shouldn't
+— a minor, acknowledged inconsistency traded for one age-band scheme
+instead of per-exercise-shaped bands.
+
+### The shared percentile → MMR curve
+
+```
+MMR(p) = 1000 + 400 * log10( p / (100 - p) )
+```
+
+The **logit of the percentile**, scaled and centred so the population
+median (`p=50`) lands exactly on the existing seed (1000). This is not a
+new curve invented for this feature — it's `_mmr_expected()`'s own
+logistic family (base 10, `/400`) run in reverse, so a fighter seeded this
+way and paired against a population-average (1000) opponent has an
+Elo-implied win expectation consistent with the percentile they were
+seeded from (asserted directly in the db test). **One function
+(`_mmr_from_percentile()`), called by every exercise type** — pushups,
+plank and wallsit via `_mmr_seed_from_norms()`, race via
+`_mmr_seed_from_race_time()` — per "define the percentile mapping once and
+reuse it consistently."
+
+Every caller clamps its percentile-shaped input to `[1, 99]` first, which
+keeps `p/(100-p)` away from 0 and infinity and bounds the output to
+roughly `[202, 1798]` — comfortably inside Commoner through Ultimate
+Champion, never at a literal floor or an unbounded top.
+
+### The interpolator
+
+`_perf_percentile_from_anchors(raw, anchors_raw[], anchors_pct[])` —
+piecewise-linear between the bracketing anchor pair; beyond either end,
+extrapolates using the nearest segment's slope, then clamps to `[1, 99]` —
+a single sourced or estimated data point should never be read as "the 0th
+percentile of anyone who has ever lived." `NULLIF` guards every division
+so two anchors sharing a `raw_value` (none do in the seed data — asserted
+by a monotonicity db test across all 42 groups) degrade to a flat
+percentile instead of dividing by zero. Fewer than two anchors — including
+a `NULL` array, what `array_agg` returns over zero matching rows — returns
+`NULL` rather than raising: an incomplete or missing norms row degrades to
+"no seed available," never a failed settlement.
+
+### Where the seed applies: first rated bout only
+
+Point 2 in the task is precise, and the implementation matches it exactly:
+**"before their first placement match's Elo update is even calculated"**
+— singular, one-time, not re-applied on placement bouts 2 through 5.
+
+Inside `_mmr_rate_match()`, `fitness_profiles.gender` / `age_band` are
+pulled alongside the rating snapshot in the same query (an added `JOIN`,
+**not a new lock** — read without `FOR UPDATE`, so it cannot change the
+deadlock ordering `LOCK ORDER` in `20260908000000` established). Then, for
+any participant whose `matches_played` is exactly `0` — this bout *is*
+their first rated bout in this exercise — `v_mmr[i]` is overridden with
+the norms-based seed **before the pairwise `E_ij` loop runs**, so every
+expectation calculation in this bout (both this fighter's own, and every
+opponent's expectation *against* them) uses the adjusted number, not the
+stale flat seed. Every later placement bout leaves `v_mmr[i]` untouched.
+
+Their own verified score for *this* bout is always present by the time
+`_mmr_rate_match()` runs — `settle_match()` already refused to reach here
+with a `NULL` score — so **the only real gate on norms-seeding is
+`gender`/`age_band` being on file**, exactly "if their verified
+performance data is available … and they've provided age/gender." Missing
+either falls back to the population-median seed (unchanged 1000, K=100
+placement as before), **never a block on placement** — point 3.
+
+`skill_rating_events.norms_seeded` records, per bout, whether this
+actually fired — independently queryable, not inferred from the numbers.
+`mmr_before` in that row is always the value actually used for the Elo
+calculation (the norms seed when applied, the flat 1000 otherwise), so the
+`delta = mmr_after - mmr_before` invariant stays honest.
+
+### Optional demographics
+
+`fitness_profiles.gender` (`male`/`female`) and `age_band` (the seven
+bands above), both nullable, neither required to play. **Binary gender**
+because that is the shape of every source table this feature draws on
+(ACSM, Chase et al., the wall-sit numbers, WMA's factors are all
+published men's/women's) — a limitation of the source data, not a claim
+about how many genders exist. Anyone who doesn't select one simply gets
+the population-median seed, the same as anyone who leaves any other
+optional field blank.
+
+Set only through `update_my_profile()` (`p_age_band`, `p_gender`), the
+same SECURITY DEFINER identity function from `20260907000000`. The old
+3-arg signature is **dropped, not left alongside** — the same rule
+`20260903300000` established for `submit_verification_session()`: adding
+trailing `DEFAULT`-valued parameters still creates a second overload that
+PostgREST cannot resolve a 3-arg call against unambiguously. Client UI:
+Settings → Profile gained an "ABOUT YOU" section with two chip rows
+(gender, age band); picking a chip saves immediately, the same
+save-on-tap pattern the Profile screen's strength-tier sheet already uses
+— no validation needed, since Postgres itself rejects anything outside
+the enum at the call boundary.
+
+### Race / WMA age-grading — read this before trusting any of it
+
+WMA (World Masters Athletics) age-grading is a real, well-established
+method — that part is genuinely "high confidence," which is why the table
+above grades it that way. What it needs is a **large published table** of
+per-age, per-event, per-gender factors (and an "open standard" time per
+event) that WMA/Alan Jones publish to several decimal places. **This
+feature was not given that table as source data**, and this implementation
+does not have it memorized precisely enough to reproduce without risking
+fabrication — doing so would be exactly the "invent additional precision
+that isn't in the source data" the task says not to do.
+
+So instead: the **pipeline** (`race_standards` → `_mmr_seed_from_race_time()`)
+implements the real WMA formula shape —
+
+```
+AG% = standard / (actual / age_factor) * 100
+```
+
+— using two inputs that are **loudly, unmistakably named as placeholders**:
+
+1. **`race_standards.standard_seconds`** — a rounded, approximate
+   open-class (roughly world-record-level) **mile** time (only `mile` is
+   seeded — `EXERCISE_LABEL.race` is "1-Mile Race" in `src/theme/copy.ts`,
+   the only race distance FittrApp defines). Deliberately rounded to a
+   5-second increment (225s men, 250s women) rather than stating a
+   specific record time as if precisely sourced. **Not WMA's own
+   published standard.**
+2. **`_race_age_factor_APPROXIMATE()`** — the function name says
+   `APPROXIMATE` on purpose. Flat 1.0 through age 30, then +1%/year
+   beyond it, identically for every event and both genders. Real WMA age
+   factors are nonlinear and vary by event; this doesn't attempt that
+   curve.
+
+`age_factor > 1` for an older runner shrinks the age-adjusted-equivalent
+time below their raw actual time before comparing to the standard — the
+same clock time earns a *higher* age grade the older the runner is, which
+is the whole point of age grading, and the db test asserts this direction
+is correct even though the magnitude is a placeholder. The result is
+clamped to `[1, 99]` and fed through the same `_mmr_from_percentile()`
+every other exercise uses, per the instruction to map the percentage to
+MMR "the same way the other three map percentile to MMR" — stated there
+explicitly because an age-graded % is **not itself a population
+percentile**; the implementation follows that instruction rather than
+asserting the two are the same statistic.
+
+**Neither placeholder should be trusted for anything beyond a rough
+placement seed** until replaced with WMA's actual published tables
+(available from World Masters Athletics / mastersathletics.net, or Alan
+Jones' age-grading calculators).
+
+**Not wired into `settle_match()` / `_mmr_rate_match()`.** Race has no
+verification or settlement path yet — `settle_match()` still raises for
+challenge type `race` (see "Settlement," "Winner rules"), unchanged by
+this migration and re-asserted by a db test. This section exists so the
+pipeline is complete and independently testable ahead of that work, per
+"for all four exercise types" — when race verification is eventually
+built, wiring it in becomes "call this function," not "design this
+function."
+
+### What's NOT verified
+
+`__tests__/performanceNorms.db.test.ts` (34 tests) runs the real migration
+SQL against a real embedded Postgres: reference-table integrity
+(coverage, strict monotonicity across all 42 anchor groups, percentile
+bounds, exact reproduction of the sourced plank baseline and the
+women's-pushups five-band data), the shared percentile curve's symmetry
+and its consistency with `_mmr_expected()`, the interpolator's exact,
+interpolated and extrapolated cases, the first-bout-only integration
+point (placed and unplaced, 1v1 and group, across all three ranked
+exercises), the population-median fallback in all three
+missing-demographic combinations, that settlement's payout arithmetic is
+untouched, the standalone race pipeline's direction (faster → higher,
+older → higher for the same time) and its null-safety, and both the new
+and old `update_my_profile()` call shapes.
+
+**None of it exercises a real bout.** Same caveats as the rest of the
+rating system, plus two specific to this feature:
+
+1. **The reference data's real-world accuracy is unverified by
+   construction**, not merely by missing a test — wall-sit and the
+   age-decline rates are estimates by design, and the race standards are
+   explicit placeholders. No test can validate that a "high" push-up
+   confidence rating in this system corresponds to an actual high
+   push-up count in the real population; the tests validate that the
+   *pipeline* computes what the seeded numbers say it should, not that
+   the seeded numbers are correct.
+2. **`update_my_profile()`'s new fields have never been read through
+   PostgREST**, and the ProfileEditor "ABOUT YOU" chips have not been
+   exercised against a live profile — they typecheck and follow the
+   existing save-on-tap pattern, but no test mounts the screen.
+
+### ⚠️ Deploy status: `20260910000000_performance_norms` is NOT applied
+
+Written and tested locally on 2026-09-10, layered on top of
+`20260909000000_skill_ratings`, which is **also still not applied** (see
+above). Neither is on the live Supabase project; no EAS build carries the
+client half. Same loop as always: commit → push → `npm run db:deploy` →
+`eas build` → install — and both pending migrations go together, in
+order, in the same deploy.

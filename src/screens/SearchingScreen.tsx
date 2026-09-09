@@ -17,7 +17,7 @@ import {
   HEARTBEAT_MS,
   MATCH_COUNTDOWN_SECONDS,
   QUEUE_TTL_SECONDS,
-  TIER_WIDEN_AFTER_SECONDS,
+  RANK_WIDEN_AFTER_SECONDS,
   cancelReasonCopy,
   enterErrorCopy,
   enterMatchmaking,
@@ -435,7 +435,7 @@ export function SearchingScreen({ route, navigation }: Props) {
     // the timeout fired, `leave` routes into the bout instead of ending.
     const ok = await leave();
     if (ok && !goneRef.current) {
-      setMessage(`No fighters found in ${SEARCH_TIMEOUT_SECONDS}s. Try again, or pick a different stake or tier.`);
+      setMessage(`No fighters found in ${SEARCH_TIMEOUT_SECONDS}s. Try again, or pick a different stake.`);
       setPhaseTracked('ended');
     }
   }, [leave, setPhaseTracked]);
@@ -497,7 +497,7 @@ export function SearchingScreen({ route, navigation }: Props) {
   // ── Render ────────────────────────────────────────────────────────────
 
   const myInitials = initialsOf(ownHandle(session));
-  const widened = elapsed >= TIER_WIDEN_AFTER_SECONDS;
+  const widened = elapsed >= RANK_WIDEN_AFTER_SECONDS;
   const pot = request.stake * seats;
   const exercise = EXERCISE_LABEL[request.exerciseType];
 
@@ -592,7 +592,7 @@ export function SearchingScreen({ route, navigation }: Props) {
       <Dock style={styles.dock}>
         {phase === 'searching' && !widened ? (
           <Notice icon="clock" iconColor={colors.secondary} style={styles.notice}>
-            {`Matching fighters at your tier for a ${fmtPoints(request.stake)} ${UNIT} bout. After ${TIER_WIDEN_AFTER_SECONDS}s we also look one tier either side.`}
+            {`Matching fighters at your rank for a ${fmtPoints(request.stake)} ${UNIT} bout. After ${RANK_WIDEN_AFTER_SECONDS}s we widen the net.`}
           </Notice>
         ) : null}
         {phase === 'ended' || phase === 'error' ? (
@@ -674,7 +674,7 @@ function Radar({
         {connecting
           ? 'Connecting to the queue.'
           : widened
-            ? 'Nobody at your exact tier yet, so the net is wider now: one tier either side.'
+            ? 'Nobody at your rank yet, so the net is wider now.'
             : 'Live matchmaking. The moment a fighter at your level is here, the bout opens for both of you.'}
       </Body>
     </View>
@@ -725,7 +725,7 @@ function LobbyCard({
       <Text style={styles.lobbyNote}>
         {toGo === 0
           ? 'Full house. Camera opens for everyone at once.'
-          : `Starts the moment the last spot fills. ${toGo} to go.${widened ? ' Now open to neighbouring tiers.' : ''}`}
+          : `Starts the moment the last spot fills. ${toGo} to go.${widened ? ' Now open to a wider range of ranks.' : ''}`}
       </Text>
     </Card>
   );

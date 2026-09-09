@@ -26,12 +26,14 @@ import {
 } from '../lib/boutStats';
 import { fmtPoints, formatSeconds } from '../lib/format';
 import { peerHandle } from '../lib/identity';
+import { ratingResultFor, type RatingResult } from '../lib/skillRating';
 import type { RootStackParamList } from '../navigation/types';
 import type {
   ChallengeRow,
   MatchParticipantRow,
   MatchRow,
   PointsLedgerEntryRow,
+  SkillRatingEventRow,
 } from '../types/database';
 import { EXERCISE_LABEL, UNIT } from '../theme/copy';
 import { Icon } from '../theme/icons';
@@ -63,6 +65,13 @@ export function ResultsScreen({ route, navigation }: Props) {
   const [ledgerEntries, setLedgerEntries] = useState<PointsLedgerEntryRow[]>(
     [],
   );
+  // What this bout did to my rating for this exercise. RLS scopes the table
+  // to my own rows, so at most one row comes back and it is always mine --
+  // an opponent's rating is never on the wire. Null until settlement has
+  // written it, and for any bout fought before ratings existed.
+  const [ratingEvent, setRatingEvent] = useState<SkillRatingEventRow | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
 
   // settle_match() is normally invoked inside submit_verification_session() the
@@ -87,8 +96,12 @@ export function ResultsScreen({ route, navigation }: Props) {
       return;
     }
 
-    const [{ data: challengeData }, { data: participantData }, { data: ledger }] =
-      await Promise.all([
+    const [
+      { data: challengeData },
+      { data: participantData },
+      { data: ledger },
+      { data: rating },
+    ] = await Promise.all([
         supabase
           .from('challenges')
           .select('*')
@@ -103,11 +116,17 @@ export function ResultsScreen({ route, navigation }: Props) {
           .select('*')
           .eq('match_id', matchId)
           .order('created_at', { ascending: true }),
+        supabase
+          .from('skill_rating_events')
+          .select('*')
+          .eq('match_id', matchId)
+          .maybeSingle(),
       ]);
 
     setChallenge((challengeData ?? null) as ChallengeRow | null);
     setParticipants((participantData ?? []) as MatchParticipantRow[]);
     setLedgerEntries((ledger ?? []) as PointsLedgerEntryRow[]);
+    setRatingEvent((rating ?? null) as SkillRatingEventRow | null);
     setLoading(false);
   }, [matchId]);
 
@@ -171,6 +190,11 @@ export function ResultsScreen({ route, navigation }: Props) {
   const kind: Kind = !match
     ? 'pending'
     : outcomeOf(match, challenge?.status ?? 'matched', me ?? '', net, stake);
+
+  // The rating line. Null until settlement has rated the bout; a number
+  // only once this exercise is placed -- see showsDelta() for why placement
+  // bouts stay silent.
+  const rating = ratingResultFor(ratingEvent);
 
   // The win screen lands with a shake, per the design.
   useEffect(() => {
@@ -304,6 +328,7 @@ export function ResultsScreen({ route, navigation }: Props) {
             rows={scoreRows}
             caption={`${exercise} · MARGIN ${margin}`}
           />
+          {rating ? <RatingLine result={rating} onAccent /> : null}
         </Animated.View>
         <Dock transparent style={styles.dock}>
           <Button label="SHARE THE CARD" variant="onAccentDark" icon="share" onPress={share} />
@@ -411,6 +436,7 @@ export function ResultsScreen({ route, navigation }: Props) {
           </View>
         ) : null}
         {match ? <ScoreCard rows={scoreRows} caption={caption} /> : null}
+        {rating ? <RatingLine result={rating} /> : null}
       </View>
       <Dock style={styles.dock}>
         {kind === 'loss' || kind === 'tie' ? (
@@ -422,6 +448,41 @@ export function ResultsScreen({ route, navigation }: Props) {
         ) : null}
         <Button label="BACK TO BOUTS" variant="card" onPress={home} />
       </Dock>
+    </View>
+  );
+}
+
+/**
+ * What the bout did to this exercise's rank. During placement there is no
+ * number -- the swing at K=100 is large enough to read as instability
+ * rather than as the system finding a fighter's level -- so the caption
+ * carries the progress instead and the space where a delta would go stays
+ * empty. Once placed it is the plain Elo change: "+18", "−24".
+ */
+function RatingLine({
+  result,
+  onAccent,
+}: {
+  result: RatingResult;
+  onAccent?: boolean;
+}) {
+  const strong = onAccent ? colors.onAccent : colors.text;
+  const soft = onAccent ? colors.onAccentMuted : colors.dim;
+  return (
+    <View style={styles.rating}>
+      {result.delta ? (
+        <Numeral size={28} color={strong}>
+          {result.delta}
+        </Numeral>
+      ) : null}
+      <View style={styles.ratingText}>
+        <Label size={9} color={soft} tracking={0.14}>
+          RANK
+        </Label>
+        <Label size={11} color={strong} tracking={0.1}>
+          {result.caption}
+        </Label>
+      </View>
     </View>
   );
 }
@@ -602,6 +663,13 @@ const styles = StyleSheet.create({
   white: { color: colors.text },
   dimText: { color: colors.dim },
   detail: { marginTop: 14 },
+  rating: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.md,
+    marginTop: space.lg,
+  },
+  ratingText: { flex: 1, gap: 3 },
   deltaRow: {
     flexDirection: 'row',
     alignItems: 'baseline',

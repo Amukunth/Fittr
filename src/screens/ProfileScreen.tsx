@@ -6,6 +6,7 @@ import {
   StyleSheet,
   Text,
   View,
+  type ViewStyle,
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
@@ -14,14 +15,24 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { useFitnessProfile } from '../hooks/useFitnessProfile';
 import { useBoutHistory } from '../hooks/useBoutHistory';
+import { useSkillRatings } from '../hooks/useSkillRatings';
 import type { BoutSummary, HistoryMark } from '../lib/boutStats';
 import { fmtPoints, fmtSigned, relativeDay } from '../lib/format';
 import { initialsOf, ownHandle, peerHandle } from '../lib/identity';
+import {
+  PLACEMENT_BOUTS,
+  bandProgress,
+  rankTierColorFor,
+  ratingFor,
+  tierDetailFor,
+  tierLabelFor,
+} from '../lib/skillRating';
 import type { RootStackParamList } from '../navigation/types';
-import type { StrengthTier } from '../types/database';
+import type { ChallengeType, MySkillRatingRow, StrengthTier } from '../types/database';
 import { TabBar } from '../components/TabBar';
 import {
   EXERCISE_LABEL,
+  RANKED_TYPES,
   TIERS,
   TIER_COLOR,
   TIER_DESC,
@@ -52,14 +63,19 @@ export function ProfileScreen({ navigation }: Props) {
   const { session, signOut } = useAuth();
   const { profile, loading, error, refresh } = useFitnessProfile();
   const { stats, refresh: refreshHistory } = useBoutHistory();
+  const { ratings, refresh: refreshRatings } = useSkillRatings();
   const insets = useSafeAreaInsets();
   const [sheetOpen, setSheetOpen] = useState(false);
   const [updatingTier, setUpdatingTier] = useState(false);
 
+  // Both refetch on focus: a bout settled on the other fighter's device
+  // moves the record and the rating together, and Profile is where a
+  // fighter comes back to look at it.
   useFocusEffect(
     useCallback(() => {
       refreshHistory();
-    }, [refreshHistory]),
+      refreshRatings();
+    }, [refreshHistory, refreshRatings]),
   );
 
   const setTier = async (tier: StrengthTier) => {
@@ -158,6 +174,20 @@ export function ProfileScreen({ navigation }: Props) {
         </Card>
 
         {error ? <Notice icon="warning">{error}</Notice> : null}
+
+        <View>
+          <View style={styles.sectionHead}>
+            <Label>RANK BY EXERCISE</Label>
+          </View>
+          <View style={styles.ranks}>
+            {RANKED_TYPES.map(t => (
+              <RankRow key={t} type={t} rating={ratingFor(ratings, t)} />
+            ))}
+          </View>
+          <Text style={styles.helper}>
+            {`Each exercise ranks on its own. ${PLACEMENT_BOUTS} bouts place you in one.`}
+          </Text>
+        </View>
 
         {hasBouts && stats ? (
           <>
@@ -288,6 +318,43 @@ function barStyle(mark: HistoryMark | null, i: number) {
   return { height: 6, backgroundColor: colors.raised };
 }
 
+/**
+ * One exercise's standing. Three states, and they are not the same thing:
+ * never fought (no rating row at all), placing (a rating exists but is a
+ * seed we have not tested), and placed (a tier we are prepared to assert).
+ * The first two both read "Unranked"; the detail line separates them.
+ */
+function RankRow({
+  type,
+  rating,
+}: {
+  type: ChallengeType;
+  rating: MySkillRatingRow | null;
+}) {
+  const color = rankTierColorFor(rating);
+  const placed = rating?.placement_complete ?? false;
+  const fill = { width: `${Math.round(bandProgress(rating) * 100)}%`, backgroundColor: color };
+  return (
+    <View style={styles.rank}>
+      <View style={[styles.rankDot, { backgroundColor: color }]} />
+      <View style={styles.rankText}>
+        <View style={styles.rankHead}>
+          <Text style={typography.rowTitle}>{EXERCISE_LABEL[type]}</Text>
+          <Display size={15} color={color}>
+            {tierLabelFor(rating).toUpperCase()}
+          </Display>
+        </View>
+        <Text style={styles.rankDetail}>{tierDetailFor(rating)}</Text>
+        {placed ? (
+          <View style={styles.rankTrack}>
+            <View style={[styles.rankFill, fill as ViewStyle]} />
+          </View>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
 function RecentRow({ bout }: { bout: BoutSummary }) {
   const letter =
     bout.outcome === 'win'
@@ -351,8 +418,9 @@ function TierSheet({
             WHERE DO YOU FIGHT?
           </Display>
           <Small style={styles.sheetBody}>
-            Sets who you get matched with. Your verified bouts will move you if
-            you're lying.
+            How you'd describe yourself. Matchmaking doesn't use it — your
+            rank per exercise decides who you meet, and only verified bouts
+            move that.
           </Small>
           <View style={styles.tierList}>
             {TIERS.map(t => {
@@ -452,6 +520,34 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.xs,
     paddingBottom: space.sm + 2,
   },
+  ranks: { gap: 6 },
+  rank: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: space.md,
+    paddingVertical: space.md,
+    paddingHorizontal: 14,
+    borderRadius: radius.button,
+    backgroundColor: colors.card,
+  },
+  rankDot: { width: 10, height: 10, borderRadius: 5, marginTop: 5 },
+  rankText: { flex: 1 },
+  rankHead: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: space.sm,
+  },
+  rankDetail: { ...label(10, colors.dim, 0.12), marginTop: 3 },
+  rankTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: colors.raised,
+    marginTop: space.sm,
+    overflow: 'hidden',
+  },
+  rankFill: { height: 4, borderRadius: 2 },
+
   rivals: { gap: 6 },
   rival: {
     flexDirection: 'row',

@@ -18,8 +18,18 @@ import type {
 export const HEARTBEAT_MS = 5000;
 /** Server-side: an entry with no heartbeat for this long is treated as gone. */
 export const QUEUE_TTL_SECONDS = 20;
-/** Server-side: a lobby this old accepts the neighbouring tiers. */
-export const TIER_WIDEN_AFTER_SECONDS = 45;
+/**
+ * Server-side: once BOTH a lobby and a fighter have waited this long, the
+ * MMR window they may be paired within widens (150 -> 400 points). Both
+ * sides must have waited, so nobody is widened before they have queued for
+ * it themselves. Named for tiers before 20260909000000; matchmaking pairs
+ * on skill rating now, and strength_tier gates nothing.
+ */
+export const RANK_WIDEN_AFTER_SECONDS = 45;
+
+/** The MMR window between two PLACED fighters, before and after widening. */
+export const MMR_WINDOW = 150;
+export const MMR_WINDOW_WIDE = 400;
 /** Seconds between "It's on" and the camera opening, for every participant. */
 export const MATCH_COUNTDOWN_SECONDS = 3;
 

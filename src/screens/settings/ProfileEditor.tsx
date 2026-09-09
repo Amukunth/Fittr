@@ -29,18 +29,21 @@ import {
   usernameAvailable,
   usernameProblem,
 } from '../../lib/profile';
-import type { FitnessProfileRow } from '../../types/database';
+import type { AgeBand, FitnessProfileRow, Gender } from '../../types/database';
 import { Icon } from '../../theme/icons';
 import { colors, fonts, radius, sizes, space, typography } from '../../theme/tokens';
+import { AGE_BANDS, AGE_BAND_LABEL, GENDERS, GENDER_LABEL } from '../../theme/copy';
 import {
   Avatar,
   Button,
   Card,
+  Chip,
   Divider,
   Input,
   Label,
   Notice,
   Numeral,
+  Small,
   TierPill,
 } from '../../theme/ui';
 
@@ -212,6 +215,48 @@ export function ProfileEditor({
       setSaveError(errorText(e));
     } finally {
       setSaving(false);
+    }
+  };
+
+  // ── About you (age band / gender) ────────────────────────────────────
+  //
+  // Fixed-choice pickers, not free text, so unlike name/username there is
+  // nothing to validate and nothing to debounce: picking a chip saves
+  // immediately, the same pattern ProfileScreen's strength-tier sheet
+  // already uses. Both are optional forever -- neither blocks anything,
+  // and there is no "clear" affordance once set (see ProfilePatch).
+  const [savingDemo, setSavingDemo] = useState<'age' | 'gender' | null>(null);
+  const [demoError, setDemoError] = useState<string | null>(null);
+
+  const pickAgeBand = async (ageBand: AgeBand) => {
+    if (savingDemo || ageBand === profile.age_band) {
+      return;
+    }
+    setDemoError(null);
+    setSavingDemo('age');
+    try {
+      await updateMyProfile({ ageBand });
+      onChanged();
+    } catch (e) {
+      setDemoError(errorText(e));
+    } finally {
+      setSavingDemo(null);
+    }
+  };
+
+  const pickGender = async (gender: Gender) => {
+    if (savingDemo || gender === profile.gender) {
+      return;
+    }
+    setDemoError(null);
+    setSavingDemo('gender');
+    try {
+      await updateMyProfile({ gender });
+      onChanged();
+    } catch (e) {
+      setDemoError(errorText(e));
+    } finally {
+      setSavingDemo(null);
     }
   };
 
@@ -394,6 +439,53 @@ export function ProfileEditor({
         </View>
       </View>
       <Text style={styles.footnote}>Crowns are verified bouts you have won.</Text>
+
+      <Divider />
+
+      <View style={styles.field}>
+        <Label>ABOUT YOU</Label>
+        <Small style={styles.aboutBody}>
+          Optional. Gives your rank a smarter starting point during
+          placement, using real-world performance data for your group
+          instead of a flat number everyone starts at. Never required, and
+          only used before your placement bouts settle you into your real
+          rank.
+        </Small>
+      </View>
+
+      <View style={styles.field}>
+        <Label size={11} color={colors.secondary}>GENDER</Label>
+        <View style={styles.chipRow}>
+          {GENDERS.map(g => (
+            <Chip
+              key={g}
+              label={GENDER_LABEL[g]}
+              active={g === profile.gender}
+              onPress={() => pickGender(g)}
+            />
+          ))}
+        </View>
+      </View>
+
+      <View style={styles.field}>
+        <Label size={11} color={colors.secondary}>AGE</Label>
+        <View style={styles.chipRow}>
+          {AGE_BANDS.map(a => (
+            <Chip
+              key={a}
+              label={AGE_BAND_LABEL[a]}
+              active={a === profile.age_band}
+              onPress={() => pickAgeBand(a)}
+            />
+          ))}
+        </View>
+      </View>
+
+      {demoError ? (
+        <Notice icon="warning" style={styles.note}>
+          {demoError}
+        </Notice>
+      ) : null}
     </Card>
   );
 }
@@ -450,4 +542,7 @@ const styles = StyleSheet.create({
   standingValue: { marginTop: space.sm },
   crowns: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   footnote: { ...typography.footnote, marginTop: space.sm + 2 },
+
+  aboutBody: { marginTop: space.xs },
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm },
 });

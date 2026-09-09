@@ -280,3 +280,54 @@ export async function balance(db: TestDb, userId: string): Promise<number> {
   );
   return rows[0]!.points_balance;
 }
+
+/**
+ * Force a skill rating into a known state. `matchesPlayed` drives
+ * placement: the table's trigger derives placement_complete from it, so
+ * passing 5 or more is what makes a rating "placed" and therefore subject
+ * to the matchmaking MMR window.
+ */
+export async function setRating(
+  db: TestDb,
+  userId: string,
+  exercise: 'pushups' | 'plank' | 'wallsit',
+  mmr: number,
+  matchesPlayed = 5,
+): Promise<void> {
+  await db.pool.query(
+    `INSERT INTO skill_ratings (user_id, exercise_type, mmr, matches_played)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, exercise_type)
+     DO UPDATE SET mmr = EXCLUDED.mmr, matches_played = EXCLUDED.matches_played`,
+    [userId, exercise, mmr, matchesPlayed],
+  );
+}
+
+/** A user with a profile AND a placed rating in one exercise. */
+export async function createRatedUser(
+  db: TestDb,
+  exercise: 'pushups' | 'plank' | 'wallsit',
+  mmr: number,
+  opts: { points?: number; matchesPlayed?: number } = {},
+): Promise<string> {
+  const id = await createUser(db, { points: opts.points ?? 500 });
+  await setRating(db, id, exercise, mmr, opts.matchesPlayed ?? 5);
+  return id;
+}
+
+/** The current rating row for one (user, exercise), or null. */
+export async function ratingOf(
+  db: TestDb,
+  userId: string,
+  exercise: 'pushups' | 'plank' | 'wallsit',
+): Promise<{ mmr: number; matches_played: number; placement_complete: boolean } | null> {
+  const { rows } = await db.pool.query<{
+    mmr: number;
+    matches_played: number;
+    placement_complete: boolean;
+  }>(
+    'SELECT mmr, matches_played, placement_complete FROM skill_ratings WHERE user_id = $1 AND exercise_type = $2',
+    [userId, exercise],
+  );
+  return rows[0] ?? null;
+}
