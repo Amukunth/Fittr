@@ -429,6 +429,12 @@ misbehave, that (rather than a code bug) is the first thing to rule out.
 `migrate deploy` and verified afterward by re-running the failing
 `SET ROLE authenticated` reads — see the RLS section above.
 
+`20260913000000_league_rank` and `20260913000100_rank_backfill_from_settlement`
+were deployed 2026-09-13 via `migrate deploy` and verified afterward from
+the live database (catalog queries plus a data audit, not the CLI's exit
+code). See "Leagues, trophies and the Rank screen" at the end of this file
+— including the backfill bug the second migration exists to correct.
+
 The "baseline before running anything" concern this section used to lead
 with turned out to be a non-issue in practice: `migrate deploy` (unlike
 `migrate dev`) never compares against `_prisma_migrations` history for
@@ -1688,3 +1694,354 @@ the now-live tables). The commit is pushed to `main`; the next step in the
 usual loop is `eas build` → install. Until that build ships, the running
 app still shows the old Settings screen — the database is ready, the
 client on people's phones is not yet.
+
+## Leagues, trophies and the Rank screen (2026-09-13)
+
+Migration `20260913000000_league_rank`. A **second** ladder, running
+alongside the per-exercise MMR from `20260909000000` rather than replacing
+any part of it. Nothing in `_mm_find_lobby()`, `_mmr_rate_match()` or the
+rating arithmetic changed.
+
+### Why two ladders is not one ladder too many
+
+They answer different questions and neither is derivable from the other:
+
+| | MMR / RankTier | Trophies / LeagueTier |
+| --- | --- | --- |
+| Scope | per exercise | one number across every exercise |
+| Purpose | who should this fighter meet | what has this fighter done |
+| Sum | zero-sum (Elo) | positive-sum: +12 a win, −6 a loss |
+| Floor | `_mmr_floor()`, effectively unreachable | hard 0, and it is reached |
+| Visible to | its owner only | the whole leaderboard |
+| Drives | matchmaking pairing | wager ceiling, leaderboard, the Rank screen |
+
+A fighter who plays a lot and wins half will climb the trophy ladder and
+sit still on the MMR one. That is intended: trophies are a record of
+activity and results, MMR is a measurement of strength, and the number
+matchmaking actually pairs on is the second one — so the first is free to
+be generous without making anybody's bouts unfair.
+
+### The award schedule
+
+Tunable functions, same pattern as `_mm_*` and `_mmr_*`, mirrored in
+`src/lib/league.ts` and asserted against the SQL in
+`__tests__/rank.db.test.ts` so the two cannot drift:
+
+- `_trophy_win_base()` = 12
+- `_trophy_loss_penalty()` = 6
+- `_trophy_tie_award()` = 6 (shared first place in a group battle)
+- `_trophy_streak_bonus_cap()` = 5
+- `_trophy_win_award(streak_after)` = 12 + min(streak_after − 1, 5)
+
+So an unbroken run pays 12, 13, 14, 15, 16, 17, 17, 17… A loss resets the
+streak to 0. **A tie neither extends nor breaks it** — nobody beat this
+fighter and nobody was beaten. The balance is floored at 0, and the
+history row records the *floored* delta, so a loss at zero trophies is
+recorded as 0 rather than −6.
+
+### The five leagues
+
+`league_tiers`, seeded with five rows and read by `league_for()` — which is
+the **only** thing that decides which league a trophy count is in.
+
+| League | Threshold | Wager ceiling | Colour | ≈ clean wins |
+| --- | --- | --- | --- | --- |
+| Bronze | 0 | $10 | `#CD7F32` | — |
+| Silver | 50 | $25 | `#C0C0C0` | 5 |
+| Gold | 150 | $50 | `#FFD700` | 13 |
+| Platinum | 300 | $100 | `#00CFCF` | 25 |
+| Diamond | 500 | $250 | `#B9F2FF` | 40 |
+
+A table rather than a `CASE` function (which is what the MMR bands are)
+because three of the four facts are rendered on the Rank screen's tier
+cards. Unlike `performance_norms` it **is** client-readable: RLS on, one
+`auth.role() = 'authenticated'` SELECT policy, `GRANT SELECT` to
+`authenticated`, and no write grant to anyone.
+
+**`max_wager_cents` is display-only today.** Nothing in matchmaking or
+`enter_matchmaking()` reads it, and the pilot stakes points, not dollars.
+It is the ceiling that applies the day real-money play is switched on —
+which is a server-side decision (`REAL_MONEY_NOTICE`). The Rank screen
+shows it under that same notice. Wiring it into the stake picker would
+have changed matchmaking behaviour and broken existing bouts staked at 100
+points by Bronze fighters, so it was deliberately not done here.
+
+### Where the standing lives, and why
+
+Six columns on `fitness_profiles`, not a table of their own: `trophies`,
+`current_league`, `total_wins`, `total_losses`, `total_ties`,
+`current_streak`.
+
+The reason is realtime. `fitness_profiles` has been in the
+`supabase_realtime` publication since `20260903100000`, filtered
+per-subscriber by `fitness_profiles_select_own`. Putting the standing there
+means a trophy award reaches the fighter's own phone on the channel the
+points balance already uses — no new publication member, no new policy, no
+second subscription, and no second source of truth about who someone is.
+`useRankStanding` reads `payload.new` and raises the counter without a
+refetch; that is the whole live path.
+
+`total_ties` is not decoration. A group battle can end with two fighters
+sharing first, which is neither a win nor a loss, and
+`src/lib/boutStats.ts` has always counted ties **in the denominator** of
+the win rate. Without the column the Rank screen's win rate and the Profile
+screen's would differ by exactly the ties.
+
+No new client write grant: `REVOKE UPDATE` / `GRANT UPDATE(strength_tier)`
+from `20260902000000` still stands, so the only writer is
+`_rank_apply_match()`, which is SECURITY DEFINER.
+
+### Global rank is computed, not stored
+
+The spec called for `global_rank (int, computed or cached)`; it is
+computed. A cached column would have to be rewritten for every player
+ranked below whoever just won — an O(n) write on the write-hot table, and
+one that is *also* a realtime broadcast per row. `rank_standing()` counts
+the profiles ahead of the caller instead, off the new
+`fitness_profiles_trophies_idx` `(trophies DESC, created_at ASC)` index.
+One count per screen open beats a fan-out per bout.
+
+The tiebreak chain is `trophies DESC, created_at ASC, user_id ASC` in both
+`rank_standing()` and `leaderboard_page()`, so "#42 globally" is the same
+42 the board would put them at — asserted in the db test by paging to that
+offset and checking the row that comes back.
+
+### `rank_history`
+
+One row per fighter per settled bout, plus a second row for each promotion
+or demotion that bout caused. The bout row carries the delta *and* the
+balance it left behind, so the timeline is a straight read rather than a
+running sum the client maintains — and `sum(trophy_delta)` can always be
+audited against `trophies`.
+
+- `event_type` ∈ `win | loss | tie | promotion | demotion`
+- `opponent_id` is set **only for a two-seat bout**; a group battle has no
+  single opponent to name, and the copy says so instead of inventing one.
+- A promotion row is written at `created_at + 1ms` so it sorts above its
+  own cause in a newest-first timeline.
+- A `CHECK` forbids a promotion/demotion row from carrying a non-zero
+  delta: it is a consequence of the bout row next to it, not a second award.
+- A **partial unique index** on `(user_id, match_id) WHERE event_type IN
+  ('win','loss','tie')` makes a double award impossible however many
+  callers reach `_rank_apply_match()`, while still letting the promotion
+  row sit alongside. Same guarantee `skill_rating_events` gets from its
+  `(user_id, match_id)` key. `_rank_apply_match()` *also* returns early if
+  any history row already exists for the match.
+- RLS: select-own, `GRANT SELECT` to `authenticated`, no write grant.
+- **Deliberately NOT in the realtime publication.** The profile row already
+  broadcasts the consequence of an award; publishing a second table to say
+  the same thing would double the WAL for it. The Rank screen refetches the
+  timeline when the profile broadcast arrives.
+
+### The lock order changed — read this before touching `settle_match()`
+
+The chain fixed in `20260908000000` and extended in `20260909000000` is:
+
+```
+lobby `challenges` → member `matchmaking_queue`
+  → `fitness_profiles` ORDER BY user_id → `skill_ratings` ORDER BY user_id
+```
+
+Trophies are a `fitness_profiles` write for **every fighter on the bout,
+not just the winners**. So `settle_match()`'s existing pre-lock was
+**widened** from `WHERE user_id = ANY(v_winners)` to every participant, at
+the same point and in the same `ORDER BY user_id`. That is a superset taken
+in the documented order, so the chain itself is unchanged — and it is why
+`_rank_apply_match()`, which runs last, never acquires a lock it does not
+already hold.
+
+Taking those extra locks late instead (inside the trophy step, after the
+`skill_ratings` locks) would invert the chain and deadlock two bouts
+settling over an overlapping field. Don't.
+
+### `settle_match()` placement
+
+One `PERFORM public._rank_apply_match(p_match_id, v_winners, NULL)` after
+the payout and after `_mmr_rate_match()`, before `settled_at` is stamped.
+Same bargain the rating already makes:
+
+- `needs_review` awards nothing and awards normally on the later call that
+  clears it, from the standings as they are *then*;
+- `already_settled` returns before reaching it;
+- a trophy write that fails takes the whole settlement down, rather than
+  leaving a paid-out bout with no record of itself on the ladder.
+
+Winners are **passed in**, not recomputed. `settle_match()` has already
+decided who won in order to pay the pot; recomputing inside the trophy step
+would open the possibility of the trophies going to someone the money did
+not.
+
+### Reading the ladder: three SECURITY DEFINER functions
+
+`fitness_profiles_select_own` means a client can read exactly one profile.
+A leaderboard is the opposite, so this is a deliberate, narrow widening:
+
+- `leaderboard_page(p_scope, p_limit, p_offset)` → `SETOF leaderboard_row`
+- `leaderboard_self(p_scope)` → one `leaderboard_row`, the caller's own
+- `rank_standing()` → the caller's counters + `global_rank`
+
+**Exactly what is exposed about a stranger**: `username`, `display_name`,
+`avatar_url`, `trophies`, `league`, `rank`. Nothing else. Balance,
+`strength_tier`, gender, age band, e-mail and MMR stay unreadable — the db
+test asserts the returned key set exactly, so widening it needs a
+deliberate edit that fails that test. The handle and the picture are
+already effectively public (the `avatars` bucket is world-readable by
+design, and the point of a username is that opponents see it); the trophy
+count and the league *are* the leaderboard.
+
+A composite return type rather than `RETURNS TABLE` on purpose: `OUT`
+parameters are plpgsql variables, and half of these names (`user_id`,
+`trophies`, `username`) are also column names in the query underneath them.
+
+**"Friends" means fighters you have shared a bout with**, plus yourself.
+There is no follow graph in this schema, and inventing one to satisfy the
+word would be a social feature smuggled in under a leaderboard — a new
+table, a consent flow and a moderation surface, none of which was asked
+for. Who you have fought is a real relationship the database already holds,
+it is symmetric, and it needs none of that. `_leaderboard_scope()` is the
+one place that changes if a follow graph ever lands. Friends rows are
+ranked **within the scope** (1, 2, 3…), not by their global place.
+
+**Deleted accounts are excluded.** `delete_my_account()` bans the auth row
+rather than removing it (bout history on both sides has to survive), so the
+ban is the marker for "no longer a player". `_leaderboard_scope()` joins
+`auth.users` and drops anyone with `banned_until > now()`.
+
+### Two backfills
+
+1. **Usernames.** `20260907000000` backfilled them from the sign-up handle,
+   but nothing since sets one — `fitness_profiles` rows are created by the
+   app with a `user_id` and a tier only, and Settings > Profile is the sole
+   writer. Invisible while a profile was something only its owner could
+   read; a leaderboard makes it visible. The same backfill runs again over
+   whoever has arrived since. Idempotent — it only touches NULL usernames.
+2. **The ladder itself.** Every settled `pushups`/`plank`/`wallsit` match
+   is replayed in `settled_at` order through `_rank_apply_match()` — the
+   same function settlement calls — so backfilled trophies, streaks,
+   counters and history rows are produced by exactly the rules a bout
+   settling a minute from now will use, streak bonus and all. Everyone who
+   has fought arrives on the new ladder with the record they earned rather
+   than at zero with an empty timeline. `race` is skipped (settlement has
+   never been implemented for it) and a `needs_review` bout has no
+   `settled_at`, so neither can appear.
+
+### What the tests cover
+
+- `__tests__/rank.db.test.ts` — 27 tests against a real embedded Postgres
+  with every migration replayed: the seed and the client mirror agreeing on
+  thresholds/ceilings/colours, `league_for()` at every boundary, the award
+  schedule, the streak compounding over a six-win run and resetting on a
+  loss, the zero floor, promotion and demotion rows, the group-battle tie,
+  `needs_review` awarding nothing until it is cleared, exactly-once under
+  repeated `settle_match()` calls, `rank_history` RLS, leaderboard ordering
+  and paging, the exposed key set, the friends scope, a deleted account
+  dropping off the board, and `rank_standing().global_rank` agreeing with
+  the page the board would draw.
+- `__tests__/league.test.ts` — 25 tests over the pure display rules.
+- `__tests__/rank.screen.test.tsx` — 18 tests mounting the screen with
+  Supabase faked: the hero, the server-sent thresholds winning over the
+  mirrored ones, Max Rank replacing the bar at Diamond, the pinned self
+  row, the scope switch, the timeline, and a realtime payload raising the
+  count and firing the celebration.
+
+The existing `matchmaking.db.test.ts` and `skillRating.db.test.ts` suites
+pass unchanged against the rewritten `settle_match()`, which is the main
+evidence that widening the lock and folding the trophy step in broke
+nothing.
+
+### What is NOT verified
+
+1. **Nothing has run through PostgREST.** The three new RPCs are called
+   through `supabase.rpc()` in the hooks and are typed, but no test crosses
+   the wire. A composite return type (`leaderboard_row`) is the one shape
+   here whose PostgREST JSON encoding is worth eyeballing on first run: it
+   should arrive as an array of objects for `leaderboard_page` and a single
+   object for `leaderboard_self`.
+2. **The realtime path is faked in the screen test**, exactly like
+   `searching.test.tsx` — the handler is invoked directly. That Supabase
+   actually delivers a `fitness_profiles` UPDATE carrying the six new
+   columns is unproven here, though the publication membership it relies on
+   was confirmed on 2026-09-04.
+3. **No EAS build carries any of this yet.** The Rank tab does not exist on
+   anybody's phone until one ships.
+
+### The backfill bug, and `20260913000100_rank_backfill_from_settlement`
+
+`20260913000000` was applied on 2026-09-13 and its replay was **wrong**.
+Worth reading before writing any other backfill over settled bouts.
+
+The replay recomputed each historical bout's winners from the recorded
+scores, using `settle_match()`'s own `max()` rule. That is correct for a
+bout settling *now* — `settle_match()` passes the winners it has just paid
+the pot to — but it is wrong looking backwards, because a score column and
+a settlement outcome can disagree about a bout that is already over.
+
+On the live project they did. All eleven settled bouts there ended
+`winner_id IS NULL` with every fighter refunded — ties — but two of them
+have a score recorded for one fighter and `NULL` for the other (they
+predate the null-score guard `settle_match()` has carried since
+`20260908000000`). `max()` ignores NULLs, so the replay elected the scored
+fighter as a sole winner and charged the other a loss: **trophies awarded
+against the money**, and a Rank screen that would have shown 1W–1L for two
+fighters the Profile screen reads as 8 and 10 ties.
+
+Caught by comparing the backfilled columns against what
+`deriveBoutStats()`/`outcomeOf()` derive from the ledger for the same
+fighters — a check worth running after any backfill that claims to
+reproduce a screen's numbers.
+
+The fix migration adds `_rank_winners_of_settled(match_id)`, which reads
+the outcome rather than re-deciding it:
+
+```
+winner_id IS NOT NULL  -> that one fighter won
+winner_id IS NULL      -> everyone who received a payout shared it
+no payout at all       -> nothing can be said; skip the bout
+```
+
+— exactly how `outcomeOf()` has always told a shared win from a loss. It
+then clears the ladder and replays every settled bout through
+`_rank_apply_match()` again. Clearing rather than patching keeps one code
+path producing every trophy in the database and makes the migration
+idempotent.
+
+`settle_match()` is NOT touched by the fix: it still passes the winners it
+paid, which is the same set this function would derive.
+
+### Deploy status: applied 2026-09-13
+
+Both migrations applied to the live Supabase project on **2026-09-13** via
+`npm run db:deploy`. Verified independently afterward, from the live
+database rather than from the CLI's exit code:
+
+- `league_tiers` holds exactly the five seeded rows with the thresholds,
+  ceilings and colours the client mirrors.
+- All six columns exist on `fitness_profiles`, `NOT NULL` with the right
+  defaults; `rank_history` has all eight columns.
+- `league_for`, `_rank_apply_match`, `_rank_winners_of_settled`,
+  `rank_standing`, `leaderboard_page`, `leaderboard_self` and
+  `_leaderboard_scope` all exist, with `SECURITY DEFINER` set on exactly
+  the five that need it.
+- Client grants are `SELECT` and nothing else on `league_tiers` and
+  `rank_history`; both RLS policies exist.
+- The widened pre-lock is present in the live `settle_match()` source
+  (read out of `pg_proc.prosrc`, not assumed), and the body calls
+  `_rank_apply_match`.
+- `signups` and all 23 `auth.*` tables untouched.
+
+Backfill result, after the fix migration: all 11 settled bouts on the
+ladder, 22 `tie` rows and 1 `promotion`, and four invariants at zero —
+`sum(trophy_delta)` equals `trophies` for every fighter, `current_league`
+equals `league_for(trophies)` for every fighter, nobody holds a `win`/`tie`
+row for a bout `_rank_winners_of_settled()` says they did not win, and no
+settled bout is missing from the ladder. The stored record now agrees
+fighter-for-fighter with what `deriveBoutStats()` derives.
+
+**Every historical bout on this project was a tie**, so the seeded ladder
+is all tie awards: amukunth0 60 (Silver), hiddenmanand 48, ronitkongara 18,
+aishaj2364 6, claudetest 0. Those eleven bouts are mostly score-less test
+data; if they are ever purged, re-running the replay in
+`20260913000100` against the remaining matches is what rebuilds the ladder.
+
+**Not yet done: an EAS build carrying the client half.** The database is
+ready; the Rank tab does not exist on anybody's phone until one ships.

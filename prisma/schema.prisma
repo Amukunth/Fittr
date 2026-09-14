@@ -91,6 +91,33 @@ enum RankTier {
   ultimate_champion
 }
 
+/// The trophy ladder, ascending. A SECOND ranking, and not a replacement
+/// for RankTier above: that one is per exercise and is what matchmaking
+/// pairs on, this one is a single number across every exercise and is what
+/// the wager ceiling and the public leaderboard are keyed to. Derived from
+/// FitnessProfile.trophies by the league_for() SQL function, which reads the
+/// League table below -- the enum names the leagues, the table says where
+/// they start.
+enum LeagueTier {
+  bronze
+  silver
+  gold
+  platinum
+  diamond
+}
+
+/// What one RankHistoryEntry records. A settled bout writes one of the
+/// first three per fighter, plus a promotion or demotion for anyone it
+/// moved a league.
+enum RankEventType {
+  win
+  loss
+  /// Shared first place in a group battle: neither a win nor a loss.
+  tie
+  promotion
+  demotion
+}
+
 /// Binary because that is the shape of every source table
 /// performance_norms / race_standards were seeded from (ACSM, Chase et al.,
 /// the wall-sit numbers, WMA's age factors) -- a limitation of the source
@@ -257,10 +284,79 @@ model FitnessProfile {
   gender        Gender?
   /// Optional, self-reported. See gender above.
   ageBand       AgeBand?     @map("age_band")
+
+  /// The trophy ladder, added 20260913000000. Written ONLY by
+  /// _rank_apply_match() inside settlement (SECURITY DEFINER); the client
+  /// still holds UPDATE on strength_tier alone. These live here rather than
+  /// in a table of their own because fitness_profiles is already in the
+  /// supabase_realtime publication, so a trophy award reaches the fighter's
+  /// own phone on the channel the points balance already uses.
+  trophies      Int          @default(0)
+  /// league_for(trophies). A cached derivation kept in step by the same
+  /// function that moves the count, not a second source of truth.
+  currentLeague LeagueTier   @default(bronze) @map("current_league")
+  totalWins     Int          @default(0) @map("total_wins")
+  totalLosses   Int          @default(0) @map("total_losses")
+  /// Shared first place: neither a win nor a loss, and in the denominator
+  /// of the win rate -- which is how src/lib/boutStats.ts has always
+  /// counted them, and why this column exists at all.
+  totalTies     Int          @default(0) @map("total_ties")
+  /// Consecutive wins. A loss resets it; a tie leaves it alone.
+  currentStreak Int          @default(0) @map("current_streak")
+
   createdAt     DateTime     @default(now()) @map("created_at")
   updatedAt     DateTime     @default(now()) @map("updated_at") @db.Timestamptz(6)
 
+  @@index([trophies(sort: Desc), createdAt], map: "fitness_profiles_trophies_idx")
   @@map("fitness_profiles")
+}
+
+/// The five leagues: where each starts and what it unlocks. Reference data,
+/// seeded by the migration and never written at runtime -- but unlike
+/// PerformanceNorm it IS client-readable, because the Rank screen draws a
+/// card per row. league_for() is the only thing that reads minTrophies to
+/// decide a league, so this table stays the single definition of the bands.
+model League {
+  id            String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          LeagueTier @unique
+  minTrophies   Int        @unique @map("min_trophies")
+  /// The wager ceiling this league unlocks, in cents. Forward-looking:
+  /// nothing in matchmaking reads it while the pilot stakes points. See
+  /// REAL_MONEY_NOTICE in src/theme/copy.ts.
+  maxWagerCents Int        @map("max_wager_cents")
+  /// Mirrored in LEAGUE_COLOR in src/lib/league.ts, which is what actually
+  /// paints the badge -- the column exists so the two agree.
+  colorHex      String     @map("color_hex")
+
+  @@map("league_tiers")
+}
+
+/// A fighter's rank timeline: one row per settled bout, plus a row for each
+/// promotion or demotion that bout caused. Written inside settlement, and
+/// the audit trail that makes sum(trophyDelta) = FitnessProfile.trophies.
+/// Readable by its owner alone, and deliberately NOT in the realtime
+/// publication -- the profile row already broadcasts the consequence.
+///
+/// The hand-written migration adds a partial unique index ((userId, matchId)
+/// WHERE eventType IN ('win','loss','tie')) that Prisma cannot express: it
+/// is what makes a double award impossible while still letting a promotion
+/// row sit alongside its bout row.
+model RankHistoryEntry {
+  id            String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String        @map("user_id") @db.Uuid
+  eventType     RankEventType @map("event_type")
+  /// Signed, and already floored: a loss at zero trophies records 0.
+  trophyDelta   Int           @map("trophy_delta")
+  /// The balance AFTER this event.
+  trophyBalance Int           @map("trophy_balance")
+  /// Set only for a two-seat bout; a group battle has no one opponent.
+  opponentId    String?       @map("opponent_id") @db.Uuid
+  matchId       String?       @map("match_id") @db.Uuid
+  match         Match?        @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([userId, createdAt(sort: Desc)], map: "rank_history_user_id_created_at_idx")
+  @@map("rank_history")
 }
 
 /// Settings > Notifications. One row per user, created on first change.
@@ -385,6 +481,7 @@ model Match {
   ledgerEntries PointsLedgerEntry[]
   queueEntries  MatchmakingQueueEntry[]
   ratingEvents  SkillRatingEvent[]
+  rankEvents    RankHistoryEntry[]
 
   @@map("matches")
 }

@@ -19,6 +19,8 @@ export type RootStackParamList = {
   Searching: BoutRequest;
   MatchInProgress: { matchId: string };
   Results: { matchId: string };
+  /** The trophy ladder: league, leaderboard, rank history. */
+  Rank: undefined;
   Profile: undefined;
   Settings: undefined;
   ChangePassword: undefined;

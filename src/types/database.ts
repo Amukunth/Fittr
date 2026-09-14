@@ -24,6 +24,24 @@ export type RankTier =
   | 'sovereign'
   | 'ultimate_champion';
 
+/**
+ * The trophy ladder, ascending. A second, separate ranking from RankTier
+ * above: that one is per exercise and pairs matchmaking, this one is one
+ * number across every exercise and decides the wager ceiling and the
+ * leaderboard. Thresholds live in the `league_tiers` table; league_for()
+ * in SQL is the only thing that turns a trophy count into one of these.
+ */
+export type LeagueTier = 'bronze' | 'silver' | 'gold' | 'platinum' | 'diamond';
+
+/** What one `rank_history` row records. */
+export type RankEventType =
+  | 'win'
+  | 'loss'
+  /** Shared first place in a group battle. */
+  | 'tie'
+  | 'promotion'
+  | 'demotion';
+
 export type ChallengeType = 'pushups' | 'plank' | 'wallsit' | 'race';
 
 /**
@@ -93,8 +111,94 @@ export interface FitnessProfileRow {
    */
   gender: Gender | null;
   age_band: AgeBand | null;
+  /**
+   * The trophy ladder. Written only by _rank_apply_match() inside
+   * settlement, and carried on the same realtime UPDATE payload as
+   * points_balance -- which is why the Rank screen needs no channel of its
+   * own. current_league is league_for(trophies), kept in step by the same
+   * function rather than derived on the client.
+   */
+  trophies: number;
+  current_league: LeagueTier;
+  total_wins: number;
+  total_losses: number;
+  /**
+   * Shared first place in a group battle: neither a win nor a loss, and in
+   * the denominator of the win rate. See deriveBoutStats(), which has always
+   * counted them the same way.
+   */
+  total_ties: number;
+  /** Consecutive wins. A loss resets it; a tie leaves it alone. */
+  current_streak: number;
   created_at: string;
   updated_at: string;
+}
+
+// ── League and trophies ─────────────────────────────────────────────────
+
+/**
+ * Reference data, readable by any signed-in user: the five rows that define
+ * where a league starts and what it unlocks. Seeded by the
+ * 20260913000000_league_rank migration and never written at runtime.
+ */
+export interface LeagueTierRow {
+  id: string;
+  name: LeagueTier;
+  min_trophies: number;
+  /**
+   * The wager ceiling this league unlocks, in cents. Forward-looking:
+   * nothing in matchmaking reads it while the pilot stakes points.
+   */
+  max_wager_cents: number;
+  color_hex: string;
+}
+
+/**
+ * One entry in a fighter's rank timeline. A settled bout writes one row per
+ * fighter, plus a second `promotion` / `demotion` row for anyone it moved a
+ * league. Readable by its owner alone.
+ */
+export interface RankHistoryRow {
+  id: string;
+  user_id: string;
+  event_type: RankEventType;
+  /** Signed, and already floored: a loss at zero trophies records 0. */
+  trophy_delta: number;
+  /** The balance after this event. */
+  trophy_balance: number;
+  /** Set only for a two-seat bout; a group battle has no one opponent. */
+  opponent_id: string | null;
+  match_id: string | null;
+  created_at: string;
+}
+
+/** One row of `leaderboard_page()` / `leaderboard_self()`. */
+export interface LeaderboardRow {
+  /** 1-based, within the requested scope. */
+  rank: number;
+  user_id: string;
+  username: string | null;
+  display_name: string | null;
+  avatar_url: string | null;
+  trophies: number;
+  league: LeagueTier;
+  is_me: boolean;
+}
+
+/**
+ * `rank_standing()`: the caller's own counters plus the one number their
+ * profile row cannot carry. global_rank is counted at read time, not stored
+ * -- see the migration header for why.
+ */
+export interface RankStandingRow {
+  user_id: string;
+  trophies: number;
+  current_league: LeagueTier;
+  total_wins: number;
+  total_losses: number;
+  total_ties: number;
+  current_streak: number;
+  global_rank: number;
 }
 
 /**

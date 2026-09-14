@@ -27,6 +27,10 @@ export type IconName =
   | 'wall'
   | 'run'
   | 'clock'
+  // Rank
+  | 'trophy'
+  | 'arrow-up'
+  | 'arrow-down'
   // Settings
   | 'caret-right'
   | 'lock'
@@ -457,6 +461,69 @@ export function Icon({
         </>
       );
       break;
+
+    // ── Rank ──────────────────────────────────────────────────────────
+
+    case 'trophy': {
+      // A cup with two handles over a stem and a base: the bowl is a
+      // square with heavily rounded bottom corners, the handles are half
+      // rings clipped by their own border colours.
+      const bowl: ViewStyle = {
+        position: 'absolute',
+        top: s * 0.06,
+        width: s * 0.56,
+        height: s * 0.46,
+        borderWidth: t,
+        borderTopWidth: t,
+        borderColor: color,
+        borderTopLeftRadius: t * 0.6,
+        borderTopRightRadius: t * 0.6,
+        borderBottomLeftRadius: s * 0.26,
+        borderBottomRightRadius: s * 0.26,
+      };
+      const handle = (side: 'left' | 'right'): ViewStyle => ({
+        position: 'absolute',
+        top: s * 0.12,
+        [side]: s * 0.04,
+        width: s * 0.2,
+        height: s * 0.26,
+        borderWidth: t * 0.8,
+        borderColor: color,
+        borderLeftColor: side === 'left' ? color : 'transparent',
+        borderRightColor: side === 'right' ? color : 'transparent',
+        borderTopLeftRadius: side === 'left' ? s * 0.1 : 0,
+        borderBottomLeftRadius: side === 'left' ? s * 0.1 : 0,
+        borderTopRightRadius: side === 'right' ? s * 0.1 : 0,
+        borderBottomRightRadius: side === 'right' ? s * 0.1 : 0,
+      });
+      body = (
+        <>
+          <View style={bowl} />
+          <View style={handle('left')} />
+          <View style={handle('right')} />
+          <View style={bar(t * 1.1, s * 0.16, { bottom: s * 0.16 })} />
+          <View style={bar(s * 0.46, t * 1.2, { bottom: s * 0.04 })} />
+        </>
+      );
+      break;
+    }
+    case 'arrow-up':
+    case 'arrow-down': {
+      const up = name === 'arrow-up';
+      body = (
+        <>
+          <View style={bar(t, s * 0.74)} />
+          <View
+            style={chevron(s * 0.4, {
+              top: up ? s * 0.16 : undefined,
+              bottom: up ? undefined : s * 0.16,
+              ...rot(up ? 45 : 225),
+            })}
+          />
+        </>
+      );
+      break;
+    }
 
     // ── Settings ──────────────────────────────────────────────────────
 

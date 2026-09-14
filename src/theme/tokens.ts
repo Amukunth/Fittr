@@ -74,6 +74,29 @@ export const colors = {
 } as const;
 
 /**
+ * A token colour at an opacity. Only for the palettes that arrive as bare
+ * hex and have to be washed at runtime -- the league colours, which are
+ * shared with the database (league_tiers.color_hex) and so cannot carry an
+ * alpha of their own. Everything in `colors` above already ships the exact
+ * opacities the design uses; do not re-derive those with this.
+ */
+export function alpha(hex: string, opacity: number): string {
+  const value = hex.replace('#', '');
+  const full =
+    value.length === 3
+      ? value
+          .split('')
+          .map(c => c + c)
+          .join('')
+      : value;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  const a = Math.round(Math.max(0, Math.min(1, opacity)) * 1000) / 1000;
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+/**
  * Bundled faces (assets/fonts, linked by react-native.config.js). Android
  * resolves a family by file name, iOS by PostScript name, and these files
  * are named so both agree. Never add fontWeight on top of these: Anton has

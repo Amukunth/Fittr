@@ -13,6 +13,7 @@ import { FindBoutScreen } from '../screens/FindBoutScreen';
 import { SearchingScreen } from '../screens/SearchingScreen';
 import { MatchInProgressScreen } from '../screens/MatchInProgressScreen';
 import { ResultsScreen } from '../screens/ResultsScreen';
+import { RankScreen } from '../screens/RankScreen';
 import { ProfileScreen } from '../screens/ProfileScreen';
 import { SettingsScreen } from '../screens/settings/SettingsScreen';
 import { ChangePasswordScreen } from '../screens/settings/ChangePasswordScreen';
@@ -27,8 +28,8 @@ import { TransactionsScreen } from '../screens/settings/TransactionsScreen';
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 /**
- * Bouts / Find / Profile are tabs drawn by each screen's own TabBar, but
- * they sit on this one native stack, so without this a tab tap played a
+ * Bouts / Find / Rank / Profile are tabs drawn by each screen's own TabBar,
+ * but they sit on this one native stack, so without this a tab tap played a
  * full push/pop slide with the tab bar riding along. A tab switch should
  * be instant, like a real tab bar, and the back-swipe should not reveal
  * the previous tab underneath. Searching, match and results screens keep
@@ -122,6 +123,7 @@ export function RootNavigator() {
               options={{ gestureEnabled: false }}
             />
             <Stack.Screen name="Results" component={ResultsScreen} />
+            <Stack.Screen name="Rank" component={RankScreen} options={TAB_SCREEN} />
             <Stack.Screen name="Profile" component={ProfileScreen} options={TAB_SCREEN} />
             <Stack.Screen name="Settings" component={SettingsScreen} />
             <Stack.Screen name="ChangePassword" component={ChangePasswordScreen} />
