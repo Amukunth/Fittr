@@ -2495,17 +2495,48 @@ default.
   confirmation on the way there, because by the time the window has
   closed there's nothing left to confirm losing.
 
-### Deploy status: NOT yet applied
+### Deploy status: applied 2026-09-16
 
-Everything in this section has been verified against the embedded-Postgres
-test harness only (324/324 tests passing, `tsc --noEmit` and `eslint` both
-clean). **`20260916000000_solo_mode_formats` and
-`20260916000100_solo_modes_ranked_casual` have not been run against the
-live Supabase project.** Blitz, Streak and the ranked/casual toggle will
-not function against production — every new RPC (`blitz_preview`,
-`blitz_start`, `streak_preview`, `streak_start`, `streak_next_stage`,
-`streak_buy_back_in`) and the changed signature of `enter_matchmaking`
-simply won't exist there — until `npm run db:deploy` is run and verified
-the way every prior migration in this file was: independent introspection
-against the live database, not just the CLI's exit code, per the standing
-rule in "Migration status: applied" above.
+Both migrations were deployed to the live Supabase project on **2026-09-16**
+via `npm run db:deploy` and verified independently afterward (introspection
+queries against the live database, not the CLI's exit code):
+
+- `ChallengeFormat` is exactly `{pooled, 1v1, blitz, streak}`; `blitz_runs`,
+  `streak_runs`, `streak_stage_attempts` all exist; `challenges.is_ranked`
+  and `matchmaking_queue.is_ranked` both exist.
+- All eight new/changed functions exist (`blitz_preview`, `blitz_start`,
+  `streak_preview`, `streak_start`, `streak_next_stage`,
+  `streak_buy_back_in`, `_solo_settle`, `_mmr_rate_solo`), and
+  `enter_matchmaking` has exactly **one** signature in `pg_proc` (the old
+  four-argument overload was dropped, not left ambiguous alongside the new
+  five-argument one).
+- RLS is enabled on all three new tables, each with exactly one
+  `..._select_own` SELECT policy; `blitz_start`/`streak_start` carry the
+  same `EXECUTE` ACL shape (`authenticated`, `service_role`, owner —
+  no `anon`) as the pre-existing `enter_matchmaking`/`settle_match`.
+- All seven `CHECK` constraints named in this section
+  (`challenges_solo_has_one_seat`, `matchmaking_queue_no_solo_formats`,
+  both `..._targets_ascending`, both `..._settled_is_complete`/
+  `..._won_is_complete`, `streak_runs_failed_has_failure`) and both partial
+  unique indexes (`streak_runs_one_active_per_exercise`,
+  `streak_stage_attempts_one_open_per_run`) are present.
+- The backfill produced exactly what was expected: all 11 pre-existing
+  settled bouts read `is_ranked = true`; there were no live `open` lobbies
+  at deploy time to fall through to the `false` default.
+- `npx prisma migrate status` reports the schema up to date immediately
+  after.
+
+⚠️ **Not fixed, and not worth a migration for:** `authenticated` still
+holds `REFERENCES`/`TRIGGER`/`TRUNCATE` on the three new tables (Supabase's
+default privileges, minus the `INSERT`/`UPDATE`/`DELETE` this migration
+explicitly revokes) rather than a clean `REVOKE ALL` + `GRANT SELECT`, which
+is the tidier pattern `skill_ratings`/`rank_history` use. None of those
+three grants are reachable through PostgREST's REST surface (it exposes
+only `SELECT`/`INSERT`/`UPDATE`/`DELETE` as HTTP verbs), so this is a
+cosmetic inconsistency with the rest of the schema, not a live gap — noted
+here rather than silently left for someone to wonder about later.
+
+**Still true:** no real attempt has been played through either mode —
+every check above is schema/grant introspection, not a fighter clearing a
+bar. See "What is NOT verified" above, which stands unchanged by a
+successful deploy.
