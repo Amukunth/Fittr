@@ -45,6 +45,7 @@ import {
   LiveDot,
   Notice,
   Numeral,
+  RankedBadge,
   StatCard,
   Tag,
   TopBar,
@@ -535,6 +536,12 @@ export function SearchingScreen({ route, navigation }: Props) {
         <View>
           <View style={styles.tagRow}>
             <Tag label={FORMAT_LABEL[request.format]} />
+            {/*
+              Which pool this search is in, on the screen where the wait
+              happens. Ranked and casual are separate queues, so this is not
+              merely a reminder -- it is the reason the wait may be longer.
+            */}
+            <RankedBadge mode={request.mode} />
             <Label size={11} tracking={0.12}>
               {isGroup ? `${seats} PLAYERS · ${EXERCISE_SCORE[request.exerciseType]}` : EXERCISE_SCORE[request.exerciseType]}
             </Label>

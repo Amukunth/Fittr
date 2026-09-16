@@ -29,6 +29,7 @@ function challenge(
     format: '1v1',
     stake_points: stake,
     max_participants: 2,
+    is_ranked: true,
     status,
     created_by: MARCUS,
     created_at: '2026-09-01T00:00:00Z',

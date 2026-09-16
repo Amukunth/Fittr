@@ -24,7 +24,7 @@ import {
 import { initialsOf, ownHandle, peerHandle } from '../lib/identity';
 import type { RootStackParamList } from '../navigation/types';
 import { TabBar } from '../components/TabBar';
-import { EXERCISE_LABEL, FORMAT_LABEL, UNIT } from '../theme/copy';
+import { EXERCISE_LABEL, FORMAT_LABEL, FORMAT_NAME, UNIT } from '../theme/copy';
 import { Icon } from '../theme/icons';
 import { colors, radius, space, typography } from '../theme/tokens';
 import {
@@ -282,9 +282,16 @@ function ActiveCard({
 }) {
   const yourTurn = bout.myScore === null;
   const waitingOn = bout.opponents.filter(o => o.score === null).length;
+  // A solo round settles the instant it is recorded, so "waiting on the
+  // field" is never its state: either it is yours to fight or it is already
+  // decided and has left this section.
   const status = yourTurn
-    ? 'YOUR ROUND IS OPEN'
-    : `WAITING ON ${waitingOn} OF ${bout.seats - 1}`;
+    ? bout.solo
+      ? 'YOUR ROUND IS OPEN'
+      : 'YOUR ROUND IS OPEN'
+    : bout.solo
+      ? 'SETTLING'
+      : `WAITING ON ${waitingOn} OF ${bout.seats - 1}`;
   return (
     <Pressable
       onPress={onPress}
@@ -297,10 +304,14 @@ function ActiveCard({
       <View style={styles.cardTop}>
         <Display size={26}>{EXERCISE_LABEL[bout.type]}</Display>
         <View style={styles.formatRow}>
-          <Tag label={FORMAT_LABEL[bout.format]} />
+          <Tag label={FORMAT_LABEL[bout.format]} tone={bout.solo ? 'accent' : 'raised'} />
           {bout.seats > 2 ? (
             <Label size={10} color={colors.secondary} tracking={0.12}>
               {`· ${bout.seats} PLAYERS`}
+            </Label>
+          ) : bout.solo ? (
+            <Label size={10} color={colors.secondary} tracking={0.12}>
+              · SOLO
             </Label>
           ) : null}
         </View>
@@ -349,21 +360,25 @@ function RecentRow({
             : '·';
   const won = bout.outcome === 'win';
   // A Group Battle has up to five opponents; naming the first would
-  // misdescribe the bout, so it is counted instead.
+  // misdescribe the bout, so it is counted instead. A solo attempt has none
+  // at all, so it names the mode: "Push-ups vs Blitz" is wrong, which is why
+  // the "vs" is dropped for those rows below rather than pointed at nothing.
   const versus =
-    bout.seats > 2
-      ? `${bout.seats - 1} others`
-      : bout.opponentId
-        ? peerHandle(bout.opponentId)
-        : 'open seat';
+    bout.solo
+      ? FORMAT_NAME[bout.format]
+      : bout.seats > 2
+        ? `${bout.seats - 1} others`
+        : bout.opponentId
+          ? peerHandle(bout.opponentId)
+          : 'open seat';
   const when = relativeDay(bout.createdAt);
   return (
     <Pressable
       onPress={onPress}
       accessibilityRole="button"
-      accessibilityLabel={`${EXERCISE_LABEL[bout.type]} vs ${versus}, ${when}, ${fmtSigned(
-        bout.delta,
-      )} ${UNIT}`}
+      accessibilityLabel={`${EXERCISE_LABEL[bout.type]} ${
+        bout.solo ? versus : `vs ${versus}`
+      }, ${when}, ${fmtSigned(bout.delta)} ${UNIT}`}
       style={({ pressed }) => [styles.recent, pressed && styles.pressed]}
     >
       <View
@@ -378,7 +393,9 @@ function RecentRow({
       </View>
       <View style={styles.recentText}>
         <Text style={typography.rowTitle}>
-          {EXERCISE_LABEL[bout.type]} <Text style={styles.vs}>vs</Text> {versus}
+          {EXERCISE_LABEL[bout.type]}{' '}
+          {bout.solo ? null : <Text style={styles.vs}>vs </Text>}
+          {bout.solo ? <Text style={styles.vs}>{versus}</Text> : versus}
         </Text>
         <Text style={styles.when}>{when}</Text>
       </View>

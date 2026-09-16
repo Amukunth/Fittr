@@ -73,6 +73,7 @@ const REQUEST = {
   format: '1v1',
   maxParticipants: 2,
   stake: 250,
+  mode: 'casual',
 } as const;
 
 function queueRow(over: Partial<MatchmakingQueueRow> = {}): MatchmakingQueueRow {
@@ -86,6 +87,7 @@ function queueRow(over: Partial<MatchmakingQueueRow> = {}): MatchmakingQueueRow 
     strength_tier: 'beginner',
     mmr: 1000,
     placement_complete: false,
+    is_ranked: false,
     status: 'searching',
     challenge_id: 'lobby-1',
     match_id: null,
@@ -198,6 +200,10 @@ describe('SearchingScreen', () => {
       p_format: '1v1',
       p_stake_points: 250,
       p_max_participants: 2,
+      // REQUEST defaults to casual (see the fixture above) and is always
+      // sent explicitly -- see the comment on enterMatchmaking() for why an
+      // omitted argument is not an acceptable stand-in for the toggle.
+      p_is_ranked: false,
     });
 
     // A socket drop and rejoin must not re-enter: that would surrender the

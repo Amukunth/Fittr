@@ -69,7 +69,29 @@ export type AgeBand =
   | '60s'
   | '70_plus';
 
-export type ChallengeFormat = 'pooled' | '1v1';
+/**
+ * `blitz` and `streak` are SOLO formats: one seat, no opponent, the fighter
+ * wagers against a threshold calibrated to their own MMR for the exercise.
+ * They ride the whole existing bout pipeline with max_participants = 1, so
+ * everything written against a ChallengeRow works for them unchanged -- but
+ * anything that assumes an opponent exists has to check the seat count.
+ */
+export type ChallengeFormat = 'pooled' | '1v1' | 'blitz' | 'streak';
+
+/** The two solo formats, as a narrowing of the above. */
+export type SoloFormat = Extract<ChallengeFormat, 'blitz' | 'streak'>;
+
+/**
+ * Chosen per attempt and never remembered: every screen that starts one
+ * defaults to 'casual' on mount, and only an explicit tap switches it.
+ *
+ * A casual attempt is a completely real bout -- the stake moves, the camera
+ * verifies, the anomaly gate applies, the pot pays -- that writes no
+ * skill_ratings row. That single omission is also what keeps it out of the
+ * five-bout placement requirement, because placement is counted off
+ * matches_played.
+ */
+export type RankedMode = 'ranked' | 'casual';
 
 export type ChallengeStatus =
   | 'open'
@@ -211,8 +233,15 @@ export interface ChallengeRow {
   type: ChallengeType;
   format: ChallengeFormat;
   stake_points: number;
-  /** Seats: 2 for 1v1, 3..6 for a Group Battle. */
+  /** Seats: 1 for Blitz/Streak, 2 for 1v1, 3..6 for a Group Battle. */
   max_participants: number;
+  /**
+   * Whether this bout moved skill_ratings. The Results screen badges off
+   * this, so it has to stay true of a bout forever -- which is why the
+   * migration backfilled every already-matched bout to `true` rather than
+   * to the new column default.
+   */
+  is_ranked: boolean;
   status: ChallengeStatus;
   /** Whoever opened the lobby. Not special once the bout is on. */
   created_by: string;
@@ -252,6 +281,11 @@ export interface MatchmakingQueueRow {
   mmr: number;
   /** Whether that rating was placed at entry. False widens pairing fully. */
   placement_complete: boolean;
+  /**
+   * Ranked and casual are two separate pools: a lobby only admits fighters
+   * who asked for the same thing, because a bout cannot be half-rated.
+   */
+  is_ranked: boolean;
   status: MatchmakingStatus;
   /** The lobby this entry is seated in. Never null while searching. */
   challenge_id: string | null;
@@ -368,6 +402,161 @@ export interface SkillRatingEventRow {
    */
   norms_seeded: boolean;
   created_at: string;
+}
+
+// ── Solo modes: Blitz and Streak ────────────────────────────────────────
+
+/**
+ * One Blitz attempt. Readable by its owner; written only by blitz_start()
+ * and settlement. Every target, virtual-opponent rating and multiplier is a
+ * SNAPSHOT taken when the run started, so the bar shown on the pre-bout
+ * screen is the bar settlement judges against even if a bout settling
+ * elsewhere moved the rating in between.
+ */
+export interface BlitzRunRow {
+  id: string;
+  user_id: string;
+  match_id: string;
+  exercise_type: ChallengeType;
+  stake_points: number;
+  is_ranked: boolean;
+  /** The rating the ladder was calibrated from, and tier 1's virtual opponent. */
+  mmr_at_start: number;
+  /** Strictly ascending. Reps for pushups, seconds for a hold. */
+  tier1_target: number;
+  tier2_target: number;
+  tier3_target: number;
+  /** mmr_at_start + the tier's rating offset. */
+  tier1_rating: number;
+  tier2_rating: number;
+  tier3_rating: number;
+  /** Basis points of the stake: 15000 / 20000 / 25000. */
+  tier1_bp: number;
+  tier2_bp: number;
+  tier3_bp: number;
+  /** All four null until settled, all four set after it. */
+  score: number | null;
+  /** 0..3. Zero means the first threshold was missed and nothing paid. */
+  tier_reached: number | null;
+  multiplier_bp: number | null;
+  payout_points: number | null;
+  created_at: string;
+  settled_at: string | null;
+}
+
+export type StreakRunStatus = 'active' | 'failed' | 'won';
+
+/**
+ * What `streak_preview()` (and `streak_start()`, `streak_next_stage()`,
+ * `streak_buy_back_in()` — they all return this same shape) says about the
+ * mode for one exercise. One composite answers every question the screens
+ * ask, so they can never render two inconsistent halves of one state.
+ */
+export interface StreakPreviewRow {
+  exercise_type: ChallengeType;
+  mmr: number;
+  placement_complete: boolean;
+  /**
+   * True when gender AND age_band are both on file. False means the ladder
+   * was calibrated against the mean of the two sourced populations in the
+   * default age band rather than against the fighter's own.
+   */
+  calibrated_to_me: boolean;
+  /** The run's snapshot while one is live, a fresh calibration otherwise. */
+  stage1_target: number;
+  stage2_target: number;
+  stage3_target: number;
+  stage1_rating: number;
+  stage2_rating: number;
+  stage3_rating: number;
+  /** Basis points of the opening stake paid for clearing all three. */
+  payout_bp: number;
+  /**
+   * `expired` and `cooldown` are derived from the timestamps below at read
+   * time, not stored: a failed run past its buy-back window is `expired`, a
+   * won run inside its cooldown is `cooldown`.
+   */
+  state: 'idle' | 'active' | 'failed' | 'expired' | 'cooldown';
+  run_id: string | null;
+  is_ranked: boolean | null;
+  stake_points: number | null;
+  /** Opening stake plus one per buy-back; total cost is stake * this. */
+  stakes_paid: number | null;
+  current_stage: number | null;
+  failed_stage: number | null;
+  failed_at: string | null;
+  /** failed_at + the five-hour buy-back window. TIMER 1. */
+  buyback_until: string | null;
+  completed_at: string | null;
+  /** completed_at + the five-hour win cooldown. TIMER 2. */
+  cooldown_until: string | null;
+  payout_points: number | null;
+  /** The open camera round for the current stage, if one has been opened. */
+  pending_match_id: string | null;
+  /**
+   * now() as the SERVER sees it. Both countdowns are rendered against this
+   * rather than against Date.now(), so a phone with a skewed clock shows the
+   * real remaining time instead of its own idea of it.
+   */
+  server_now: string;
+}
+
+/** `blitz_preview()`: the ladder, before anything is staked. */
+export interface BlitzPreviewRow {
+  exercise_type: ChallengeType;
+  mmr: number;
+  placement_complete: boolean;
+  /** See StreakPreviewRow.calibrated_to_me. */
+  calibrated_to_me: boolean;
+  tier1_target: number;
+  tier2_target: number;
+  tier3_target: number;
+  tier1_rating: number;
+  tier2_rating: number;
+  tier3_rating: number;
+  tier1_bp: number;
+  tier2_bp: number;
+  tier3_bp: number;
+}
+
+/** One go at one Streak stage, including every buy-back. */
+export interface StreakStageAttemptRow {
+  id: string;
+  run_id: string;
+  stage: number;
+  attempt_no: number;
+  match_id: string;
+  is_buy_back: boolean;
+  score: number | null;
+  passed: boolean | null;
+  created_at: string;
+  settled_at: string | null;
+}
+
+/** The full `streak_runs` row, for the screens that need more than the view. */
+export interface StreakRunRow {
+  id: string;
+  user_id: string;
+  exercise_type: ChallengeType;
+  stake_points: number;
+  is_ranked: boolean;
+  mmr_at_start: number;
+  stage1_target: number;
+  stage2_target: number;
+  stage3_target: number;
+  stage1_rating: number;
+  stage2_rating: number;
+  stage3_rating: number;
+  payout_bp: number;
+  status: StreakRunStatus;
+  current_stage: number;
+  stakes_paid: number;
+  failed_stage: number | null;
+  failed_at: string | null;
+  completed_at: string | null;
+  payout_points: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 // ── Settings ────────────────────────────────────────────────────────────

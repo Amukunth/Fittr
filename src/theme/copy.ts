@@ -6,6 +6,7 @@ import type {
   Gender,
   LedgerReason,
   NotificationPrefs,
+  RankedMode,
   StrengthTier,
 } from '../types/database';
 import type { IconName } from './icons';
@@ -60,19 +61,80 @@ export const VERIFIABLE_TYPES: ReadonlySet<ChallengeType> = new Set([
 export const FORMAT_LABEL: Record<ChallengeFormat, string> = {
   '1v1': '1V1',
   pooled: 'GROUP',
+  blitz: 'BLITZ',
+  streak: 'STREAK',
 };
 
 export const FORMAT_NOTE: Record<ChallengeFormat, string> = {
   '1v1': 'Head-to-head. Matched live with a fighter at your level. Winner takes both stakes.',
   pooled:
     'Group Battle. The lobby fills live, the bout opens for everyone at once, top finisher takes the pot.',
+  blitz:
+    'Solo. One set against three bars set to your level. Clear the highest one you can and take the multiplier.',
+  streak:
+    'Solo. Three stages, one stake. Clear all three in a row for the payout — miss one and you have five hours to buy back in.',
 };
 
 /** What the format is called on a card. */
 export const FORMAT_NAME: Record<ChallengeFormat, string> = {
   '1v1': '1v1',
   pooled: 'Group Battle',
+  blitz: 'Blitz',
+  streak: 'Streak',
 };
+
+/**
+ * The two solo formats, in the order Find a Bout offers them. Neither takes
+ * a player count or an opponent, and both are set up on their own pre-bout
+ * screen rather than on Find a Bout, because a stake is only half of what
+ * they need — the other half is seeing the bar before agreeing to it.
+ */
+export const SOLO_FORMATS: readonly ChallengeFormat[] = ['blitz', 'streak'];
+
+export function isSoloFormat(format: ChallengeFormat): boolean {
+  return format === 'blitz' || format === 'streak';
+}
+
+// ── Ranked / casual ─────────────────────────────────────────────────────
+
+/**
+ * Chosen per attempt, defaulted to Casual every single time, and never
+ * remembered. The copy has one job: make it impossible to think a casual
+ * bout is a practice bout. It is not — the stake really moves.
+ */
+export const RANKED_LABEL: Record<RankedMode, string> = {
+  ranked: 'RANKED',
+  casual: 'CASUAL',
+};
+
+export const RANKED_NOTE: Record<RankedMode, string> = {
+  ranked: 'This one counts. Win or lose, your rank moves and it counts toward placement.',
+  casual: 'Real stake, real payout, no rank. Nothing here touches your MMR or your placement.',
+};
+
+/** The one-line explanation under the toggle, whichever way it is set. */
+export const RANKED_TOGGLE_HELP =
+  'Casual bouts are fully real — the stake moves either way. They just leave your rank alone.';
+
+// ── Solo modes ──────────────────────────────────────────────────────────
+
+/** Shown on both pre-bout screens: where the numbers came from. */
+export const SOLO_CALIBRATION_NOTE =
+  'Your targets are set from your rank in this exercise. Climb, and they climb with you.';
+
+/**
+ * Shown when gender or age band is missing, because the targets are then the
+ * midpoint of the two populations the reference data covers rather than the
+ * fighter's own. Says what to do about it without making it a blocker.
+ */
+export const SOLO_CALIBRATION_ROUGH =
+  'These targets are a population average. Add your age band and gender in Settings to have them set to you.';
+
+export const BLITZ_RULES =
+  'One set. The highest bar you clear pays its multiplier on your stake. Miss the first one and the stake is gone.';
+
+export const STREAK_RULES =
+  'Stake once. Clear all three stages in a row to take the payout. Miss one and the run ends there — with five hours to buy back in at the same stage.';
 
 /**
  * Group Battle sizes offered by Find a Bout. The database allows 2..6 on

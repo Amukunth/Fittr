@@ -14,9 +14,15 @@ import { formatSeconds } from './format';
  * free of Supabase so it can be unit-tested (__tests__/boutStats.test.ts)
  * and so Home, Profile and Results agree on every number.
  *
- * A bout has 2..6 seats (challenges.max_participants). Everything here is
+ * A bout has 1..6 seats (challenges.max_participants). Everything here is
  * written for the field, with `opponentId` / `opponentScore` kept as "the
  * first opponent" for the 1v1 surfaces.
+ *
+ * ONE SEAT IS A SOLO MODE (Blitz or Streak), and it is deliberately counted
+ * differently in two places -- see `solo` on BoutSummary, outcomeOf(), and
+ * the `settled` filter in deriveBoutStats(). Both differences exist so this
+ * file agrees with what the database actually did rather than inventing a
+ * head-to-head reading of a bout that had no other corner.
  */
 
 export type Outcome = 'win' | 'loss' | 'tie' | 'pending' | 'review';
@@ -32,8 +38,15 @@ export interface BoutSummary {
   type: ChallengeType;
   format: ChallengeFormat;
   stake: number;
-  /** Seats on the match: 2 for 1v1, 3..6 for a Group Battle. */
+  /** Seats on the match: 1 for a solo mode, 2 for 1v1, 3..6 for a Group. */
   seats: number;
+  /**
+   * A Blitz or Streak attempt: one seat, no opponent, judged against a
+   * calibrated bar. Kept as its own flag rather than left as `seats === 1` at
+   * every call site, because the distinction changes how the row reads, not
+   * just how many names are on it.
+   */
+  solo: boolean;
   status: ChallengeStatus;
   /** Match creation, i.e. when the lobby filled. */
   createdAt: string;
@@ -61,11 +74,22 @@ export interface RivalSummary {
 export type HistoryMark = 'W' | 'L' | 'T';
 
 export interface BoutStats {
-  /** Newest first. */
+  /** Newest first. Includes solo attempts. */
   bouts: BoutSummary[];
   /** Unsettled bouts the user still has to fight or wait on, newest first. */
   active: BoutSummary[];
-  /** Settled bouts only. */
+  /**
+   * Settled HEAD-TO-HEAD bouts only. Every counter below it -- wins, losses,
+   * ties, winRate, streak, history -- is the record against other people, and
+   * solo attempts are excluded from all of them.
+   *
+   * That is not a display preference, it is agreement with the server:
+   * _solo_settle() writes no trophies and does not touch total_wins /
+   * total_losses / total_ties / current_streak, so a client that counted solo
+   * attempts here would disagree with the profile row it sits next to. Solo
+   * scores DO still feed bestByType, because a personal best is a personal
+   * best however it was set.
+   */
   played: number;
   wins: number;
   losses: number;
@@ -173,12 +197,23 @@ export function outcomeOf(
   userId: string,
   delta: number,
   stake: number,
+  /** One seat: a Blitz or Streak attempt. Read off winner_id alone. */
+  solo = false,
 ): Outcome {
   if (status === 'needs_review') {
     return 'review';
   }
   if (match.settled_at === null) {
     return 'pending';
+  }
+  // A solo attempt has no ledger tell to read. _solo_settle() sets winner_id
+  // to the fighter exactly when they cleared the bar -- tier 1 or better for
+  // Blitz, the stage's own target for Streak -- and leaves it NULL when they
+  // did not. There is no tie to have with a threshold, and the ledger cannot
+  // be used as the tell in any case: advancing into Streak stage 2 clears a
+  // bar and moves no points at all.
+  if (solo) {
+    return match.winner_id === userId ? 'win' : 'loss';
   }
   if (match.winner_id === userId) {
     return 'win';
@@ -224,7 +259,14 @@ export function deriveBoutStats(userId: string, rows: BoutRows): BoutStats {
         .map(p => ({ userId: p.user_id, score: scoreFor(p, challenge.type) })),
       challenge.type,
     );
-    const delta = ledgerByMatch.get(me.match_id) ?? -challenge.stake_points;
+    const solo = challenge.max_participants === 1;
+    // No ledger row for this match means nothing moved, which is a real state
+    // for a solo mode: advancing into Streak stage 2 or 3 opens a round on the
+    // stake already paid at the start of the run. For a queued bout the stake
+    // entry is always written by _mm_try_complete(), so the fallback there
+    // stays what it has always been -- a defensive "you are down your stake".
+    const ledgered = ledgerByMatch.get(me.match_id);
+    const delta = ledgered ?? (solo ? 0 : -challenge.stake_points);
     const first = opponents[0] ?? null;
     bouts.push({
       matchId: match.id,
@@ -233,6 +275,7 @@ export function deriveBoutStats(userId: string, rows: BoutRows): BoutStats {
       format: challenge.format,
       stake: challenge.stake_points,
       seats: challenge.max_participants,
+      solo,
       status: challenge.status,
       createdAt: match.created_at,
       settledAt: match.settled_at,
@@ -241,14 +284,25 @@ export function deriveBoutStats(userId: string, rows: BoutRows): BoutStats {
       opponents,
       opponentId: first?.userId ?? null,
       opponentScore: first?.score ?? null,
-      outcome: outcomeOf(match, challenge.status, userId, delta, challenge.stake_points),
+      outcome: outcomeOf(
+        match,
+        challenge.status,
+        userId,
+        delta,
+        challenge.stake_points,
+        solo,
+      ),
       delta,
     });
   }
   bouts.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 
+  // Head-to-head only: see the note on BoutStats.played for why solo
+  // attempts are excluded from the record but not from the feed.
   const settled = bouts.filter(
-    b => b.outcome === 'win' || b.outcome === 'loss' || b.outcome === 'tie',
+    b =>
+      !b.solo &&
+      (b.outcome === 'win' || b.outcome === 'loss' || b.outcome === 'tie'),
   );
   const wins = settled.filter(b => b.outcome === 'win').length;
   const losses = settled.filter(b => b.outcome === 'loss').length;

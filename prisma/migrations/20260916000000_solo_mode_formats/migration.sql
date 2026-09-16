@@ -1,0 +1,31 @@
+-- Adds 'blitz' and 'streak' to ChallengeFormat.
+--
+-- DELIBERATELY ALONE IN ITS OWN MIGRATION, for exactly the reason
+-- 20260903200000_add_needs_review_status and 20260906000000_add_contest_
+-- lifecycle_statuses are: Prisma wraps each migration file in a transaction
+-- (and the test harness replays each file as one multi-statement batch,
+-- which Postgres also runs as one implicit transaction), and Postgres
+-- refuses to *use* an enum value in the transaction that added it. The
+-- migration that follows uses both of these values in CHECK constraints and
+-- in SQL-language function bodies, which are parsed at CREATE time -- so
+-- co-locating them would not merely be risky, it would fail outright.
+--
+-- Appended rather than inserted next to '1v1': enum position only affects
+-- ORDER BY on the enum, nothing sorts by format, and appending avoids a
+-- table rewrite.
+--
+-- Meaning. Both are SOLO formats -- one seat, no opponent, the fighter
+-- wagers against a calibrated bar instead of against a person:
+--
+--   blitz   one set against three ascending thresholds calibrated to the
+--           fighter's MMR for that exercise. The highest threshold cleared
+--           pays its multiplier (1.5x / 2x / 2.5x) on the stake.
+--   streak  a run of up to three stages, each with its own calibrated
+--           target. Stake once, clear all three, take the payout. Failing a
+--           stage ends the run there, with a five-hour window to buy back
+--           in at the same stage.
+--
+-- See 20260916000100_solo_modes_ranked_casual for everything else, and
+-- BACKEND.md, "Blitz, Streak and ranked/casual".
+ALTER TYPE "ChallengeFormat" ADD VALUE IF NOT EXISTS 'blitz';
+ALTER TYPE "ChallengeFormat" ADD VALUE IF NOT EXISTS 'streak';

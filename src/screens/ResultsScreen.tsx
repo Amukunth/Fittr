@@ -27,15 +27,24 @@ import {
 import { fmtPoints, formatSeconds } from '../lib/format';
 import { peerHandle } from '../lib/identity';
 import { ratingResultFor, type RatingResult } from '../lib/skillRating';
+import {
+  blitzRunForMatch,
+  blitzTiersOf,
+  fmtMultiplier,
+  fmtTarget,
+  streakRunIdForMatch,
+} from '../lib/soloModes';
 import type { RootStackParamList } from '../navigation/types';
 import type {
+  BlitzRunRow,
   ChallengeRow,
   MatchParticipantRow,
   MatchRow,
   PointsLedgerEntryRow,
+  RankedMode,
   SkillRatingEventRow,
 } from '../types/database';
-import { EXERCISE_LABEL, UNIT } from '../theme/copy';
+import { EXERCISE_LABEL, UNIT, isSoloFormat } from '../theme/copy';
 import { Icon } from '../theme/icons';
 import { anton, colors, fonts, label, radius, space } from '../theme/tokens';
 import {
@@ -47,6 +56,7 @@ import {
   Label,
   Loading,
   Numeral,
+  RankedBadge,
 } from '../theme/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Results'>;
@@ -72,6 +82,12 @@ export function ResultsScreen({ route, navigation }: Props) {
   const [ratingEvent, setRatingEvent] = useState<SkillRatingEventRow | null>(
     null,
   );
+  /**
+   * The Blitz run behind this match, when there is one. Null for a
+   * head-to-head bout and for a Streak stage -- a Streak stage never renders
+   * here at all, it redirects to StreakRun (see the effect below).
+   */
+  const [blitzRun, setBlitzRun] = useState<BlitzRunRow | null>(null);
   const [loading, setLoading] = useState(true);
 
   // settle_match() is normally invoked inside submit_verification_session() the
@@ -123,10 +139,19 @@ export function ResultsScreen({ route, navigation }: Props) {
           .maybeSingle(),
       ]);
 
-    setChallenge((challengeData ?? null) as ChallengeRow | null);
+    const challengeRow = (challengeData ?? null) as ChallengeRow | null;
+    setChallenge(challengeRow);
     setParticipants((participantData ?? []) as MatchParticipantRow[]);
     setLedgerEntries((ledger ?? []) as PointsLedgerEntryRow[]);
     setRatingEvent((rating ?? null) as SkillRatingEventRow | null);
+
+    // A fifth read, and only for a Blitz. Deliberately not folded into the
+    // Promise.all above: it needs the challenge's format to know whether
+    // there is anything to fetch, and a blitz_runs read on every 1v1 result
+    // would be a wasted round trip on the commonest screen in the app.
+    if (challengeRow?.format === 'blitz') {
+      setBlitzRun(await blitzRunForMatch(matchId));
+    }
     setLoading(false);
   }, [matchId]);
 
@@ -187,13 +212,50 @@ export function ResultsScreen({ route, navigation }: Props) {
   // was paid out. RLS scopes the ledger to my rows, so this is my net.
   const net = ledgerEntries.reduce((sum, e) => sum + e.amount, 0);
   const stake = challenge?.stake_points ?? 0;
+  const solo = challenge ? isSoloFormat(challenge.format) : false;
   const kind: Kind = !match
     ? 'pending'
-    : outcomeOf(match, challenge?.status ?? 'matched', me ?? '', net, stake);
+    : outcomeOf(
+        match,
+        challenge?.status ?? 'matched',
+        me ?? '',
+        net,
+        stake,
+        solo,
+      );
+
+  /**
+   * A Streak stage never renders here. Everything a fighter needs to know
+   * after one -- next stage, buy back in, payout, the five-hour window -- is a
+   * fact about the RUN, and StreakRun owns all three states of it. This screen
+   * is still the destination the Home feed and the camera's fallback use, so
+   * it has to forward rather than refuse.
+   *
+   * `replace`, so back does not bounce between the two.
+   */
+  useEffect(() => {
+    if (challenge?.format !== 'streak') {
+      return;
+    }
+    let cancelled = false;
+    streakRunIdForMatch(matchId).then(found => {
+      if (!cancelled && found) {
+        navigation.replace('StreakRun', { runId: found.runId });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [challenge?.format, matchId, navigation]);
 
   // The rating line. Null until settlement has rated the bout; a number
   // only once this exercise is placed -- see showsDelta() for why placement
   // bouts stay silent.
+  //
+  // A casual bout has no event row at all, by construction: settle_match()
+  // skips _mmr_rate_match() entirely, so nothing was written. That is why the
+  // screen shows NO rating line rather than a "0" -- there is no change to
+  // report, which is different from a change of zero.
   const rating = ratingResultFor(ratingEvent);
 
   // The win screen lands with a shake, per the design.
@@ -218,6 +280,33 @@ export function ResultsScreen({ route, navigation }: Props) {
   if (loading) {
     return <Loading />;
   }
+
+  const mode: RankedMode = challenge?.is_ranked ? 'ranked' : 'casual';
+
+  // A Blitz result is not a win or a loss against anybody, so it does not
+  // borrow either screen: it shows the ladder with the rung that was reached
+  // marked, the multiplier that rung paid, and the payout. The lime flood is
+  // still reserved for "you took something", which here means tier 1 or
+  // better.
+  if (challenge && challenge.format === 'blitz' && blitzRun?.settled_at) {
+    return (
+      <BlitzResult
+        run={blitzRun}
+        challenge={challenge}
+        mode={mode}
+        rating={rating}
+        onHome={home}
+        onAgain={() =>
+          navigation.replace('BlitzPre', { exerciseType: challenge.type })
+        }
+      />
+    );
+  }
+
+  // A solo round that has not settled yet -- in practice only one held for
+  // anomaly review, since there is no opponent to wait for -- falls through to
+  // the shared pending / review states below, which already say the right
+  // thing about a held pot.
 
   const type = challenge?.type ?? 'pushups';
   const mine = participants.find(p => p.user_id === me) ?? null;
@@ -275,14 +364,22 @@ export function ResultsScreen({ route, navigation }: Props) {
   // queue, so there is no way to re-challenge one fighter directly — the
   // next opponent is whoever the queue pairs, the same one if they search too.
   const rematch = () => {
-    if (!challenge) {
+    // Only ever rendered for a head-to-head bout: Blitz redirects to
+    // BlitzResult and Streak redirects to StreakRun before either loss/tie
+    // branch below can render, so `challenge.format` is always '1v1' or
+    // 'pooled' here -- the cast states that instead of leaving it implicit.
+    if (!challenge || isSoloFormat(challenge.format)) {
       return;
     }
     navigation.replace('Searching', {
       exerciseType: challenge.type,
-      format: challenge.format,
+      format: challenge.format as Extract<typeof challenge.format, '1v1' | 'pooled'>,
       maxParticipants: challenge.max_participants,
       stake: challenge.stake_points,
+      // A rematch keeps the mode it was played in, rather than resetting to
+      // casual: it is a continuation of the same intent, not a fresh visit
+      // to Find a Bout (which is the one place the default has to reset).
+      mode: challenge.is_ranked ? 'ranked' : 'casual',
     });
   };
 
@@ -328,6 +425,10 @@ export function ResultsScreen({ route, navigation }: Props) {
             rows={scoreRows}
             caption={`${exercise} · MARGIN ${margin}`}
           />
+          {/* Whether this one counted, on the record of it. */}
+          <View style={styles.badgeRow}>
+            <RankedBadge mode={mode} onAccent />
+          </View>
           {rating ? <RatingLine result={rating} onAccent /> : null}
         </Animated.View>
         <Dock transparent style={styles.dock}>
@@ -436,6 +537,11 @@ export function ResultsScreen({ route, navigation }: Props) {
           </View>
         ) : null}
         {match ? <ScoreCard rows={scoreRows} caption={caption} /> : null}
+        {match ? (
+          <View style={styles.badgeRow}>
+            <RankedBadge mode={mode} />
+          </View>
+        ) : null}
         {rating ? <RatingLine result={rating} /> : null}
       </View>
       <Dock style={styles.dock}>
@@ -447,6 +553,180 @@ export function ResultsScreen({ route, navigation }: Props) {
           />
         ) : null}
         <Button label="BACK TO BOUTS" variant="card" onPress={home} />
+      </Dock>
+    </View>
+  );
+}
+
+/**
+ * A settled Blitz, rendered as what it is: a ladder with a mark on the rung
+ * that was reached.
+ *
+ * Deliberately NOT the 1v1 win or loss screen with different words. There is
+ * no opponent, no margin and no tale of the tape; the only comparison that
+ * means anything is the one between the score and the three bars, so that is
+ * the whole card. Tier 0 keeps the dark screen and says which bar was missed
+ * and by how much, because "you needed three more reps" is the one thing
+ * worth knowing on the way to trying again.
+ */
+function BlitzResult({
+  run,
+  challenge,
+  mode,
+  rating,
+  onHome,
+  onAgain,
+}: {
+  run: BlitzRunRow;
+  challenge: ChallengeRow;
+  mode: RankedMode;
+  rating: RatingResult | null;
+  onHome: () => void;
+  onAgain: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const tiers = blitzTiersOf(run);
+  const reached = run.tier_reached ?? 0;
+  const paid = reached > 0;
+  const score = run.score ?? 0;
+  const type = challenge.type;
+  const exercise = EXERCISE_LABEL[type].toUpperCase();
+  const missed = tiers[0]!.target - score;
+  const headPad = { paddingTop: insets.top + space.xl };
+
+  const share = () => {
+    const line = paid
+      ? `Blitz on Fittr: ${fmtTarget(score, type)} ${type === 'pushups' ? 'push-ups' : 'hold'} at ${fmtMultiplier(run.multiplier_bp ?? 0)}. +${fmtPoints(run.payout_points ?? 0)} ${UNIT}.`
+      : `Blitz on Fittr: ${fmtTarget(score, type)}. Missed the first bar by ${fmtTarget(missed, type)}.`;
+    Share.share({ message: line }).catch(() => undefined);
+  };
+
+  const ladder = (
+    <View
+      style={[
+        styles.blitzLadder,
+        { backgroundColor: paid ? colors.onAccentWash : colors.card },
+      ]}
+    >
+      {tiers.map(tier => {
+        const cleared = reached >= tier.tier;
+        const isTop = reached === tier.tier;
+        const strong = paid ? colors.onAccent : colors.text;
+        const soft = paid ? colors.onAccentMuted : colors.secondary;
+        const faint = paid ? colors.onAccentFaint : colors.dim;
+        const ink = isTop ? strong : cleared ? soft : faint;
+        return (
+          <View key={tier.tier} style={styles.blitzRow}>
+            <View style={styles.blitzLeft}>
+              <Icon
+                name={cleared ? 'check' : 'x'}
+                size={12}
+                color={cleared ? ink : faint}
+              />
+              <Label size={11} color={ink} tracking={0.1}>
+                {`${fmtTarget(tier.target, type)} ${type === 'pushups' ? 'REPS' : 'HOLD'}`}
+              </Label>
+            </View>
+            <Display size={isTop ? 22 : 18} color={ink}>
+              {fmtMultiplier(tier.bp)}
+            </Display>
+          </View>
+        );
+      })}
+      <Label color={paid ? colors.onAccentFaint : colors.dim}>
+        {`${exercise} · YOU DID ${fmtTarget(score, type)} · STAKED ${fmtPoints(run.stake_points)}`}
+      </Label>
+    </View>
+  );
+
+  if (paid) {
+    return (
+      <View style={styles.flood}>
+        <Text style={styles.watermarkWin} pointerEvents="none">
+          {fmtMultiplier(run.multiplier_bp ?? 0)}
+        </Text>
+        <View style={[styles.head, headPad]}>
+          <View style={styles.verified}>
+            <Icon name="seal-check" size={14} color={colors.onAccent} contrast={colors.accent} />
+            <Label size={11} color={colors.onAccentMuted}>
+              {`BLITZ · TIER ${reached} OF 3`}
+            </Label>
+          </View>
+          <IconCircle
+            icon="x"
+            bg={colors.onAccentGhost}
+            color={colors.onAccent}
+            accessibilityLabel="Close"
+            onPress={onHome}
+          />
+        </View>
+        <View style={styles.body}>
+          <Display size={60} tracking={-0.015} color={colors.onAccent}>
+            {`${fmtMultiplier(run.multiplier_bp ?? 0)}`}{'\n'}CLEARED.
+          </Display>
+          <View style={styles.deltaRow}>
+            <Numeral size={110} color={colors.onAccent}>
+              {`+${fmtPoints(run.payout_points ?? 0)}`}
+            </Numeral>
+            <Label size={14} color={colors.onAccentMuted} tracking={0.2}>
+              {UNIT}
+            </Label>
+          </View>
+          {ladder}
+          <View style={styles.badgeRow}>
+            <RankedBadge mode={mode} onAccent />
+          </View>
+          {rating ? <RatingLine result={rating} onAccent /> : null}
+        </View>
+        <Dock transparent style={styles.dock}>
+          <Button label="SHARE THE CARD" variant="onAccentDark" icon="share" onPress={share} />
+          <Button label="GO AGAIN" variant="onAccentGhost" onPress={onAgain} />
+        </Dock>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.watermarkLoss} pointerEvents="none">
+        0
+      </Text>
+      <View style={[styles.head, headPad]}>
+        <View style={styles.verified}>
+          <Icon name="seal-check" size={14} color={colors.dim} contrast={colors.bg} />
+          <Label size={11}>BLITZ · NO TIER</Label>
+        </View>
+        <IconCircle icon="x" color={colors.secondary} accessibilityLabel="Close" onPress={onHome} />
+      </View>
+      <View style={styles.body}>
+        <Display size={60} tracking={-0.015} color={colors.secondary}>
+          SHORT OF{'\n'}
+          <Text style={styles.white}>THE FIRST.</Text>
+        </Display>
+        <Body muted style={styles.detail}>
+          {`You needed ${fmtTarget(tiers[0]!.target, type)} for ${fmtMultiplier(tiers[0]!.bp)} and got ${fmtTarget(score, type)}. The bars move with your rank, so they will be here next time.`}
+        </Body>
+        <View style={styles.deltaRow}>
+          <Numeral size={110} color={colors.dim}>
+            {`−${fmtPoints(run.stake_points)}`}
+          </Numeral>
+          <Label size={14} tracking={0.2}>
+            {UNIT}
+          </Label>
+        </View>
+        {ladder}
+        <View style={styles.badgeRow}>
+          <RankedBadge mode={mode} />
+        </View>
+        {rating ? <RatingLine result={rating} /> : null}
+      </View>
+      <Dock style={styles.dock}>
+        <Button
+          label={`GO AGAIN · ${fmtPoints(run.stake_points)} ${UNIT}`}
+          icon="rematch"
+          onPress={onAgain}
+        />
+        <Button label="BACK TO BOUTS" variant="card" onPress={onHome} />
       </Dock>
     </View>
   );
@@ -676,6 +956,20 @@ const styles = StyleSheet.create({
     gap: space.sm,
     marginTop: 22,
   },
+  badgeRow: { marginTop: space.lg },
+  blitzLadder: {
+    marginTop: space.xxl,
+    borderRadius: radius.card,
+    padding: space.lg,
+    gap: space.md,
+  },
+  blitzRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  blitzLeft: { flexDirection: 'row', alignItems: 'center', gap: space.sm + 2 },
+
   scoreCard: {
     marginTop: space.xxl,
     borderRadius: radius.card,

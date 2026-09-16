@@ -16,8 +16,8 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import type { StrengthTier } from '../types/database';
-import { TIER_COLOR, TIER_LABEL } from './copy';
+import type { RankedMode, StrengthTier } from '../types/database';
+import { RANKED_LABEL, TIER_COLOR, TIER_LABEL } from './copy';
 import { Icon, type IconName } from './icons';
 import {
   anton,
@@ -629,6 +629,111 @@ export function Toggle({
   );
 }
 
+const RANKED_MODES: readonly RankedMode[] = ['casual', 'ranked'];
+
+/**
+ * The ranked / casual switch. Two halves of one control, Casual first and
+ * selected, so switching to Ranked is a deliberate tap on the other half
+ * rather than a slider someone might have left where it was.
+ *
+ * Deliberately NOT a `Toggle`: a switch has an implied "off", and casual is
+ * not the absence of ranked, it is the other one of two real choices. It is
+ * also why this is a visible control on every screen that starts an attempt
+ * rather than a setting — after the fact, "did that bout count?" has to be
+ * answerable from the bout, and before it, from the screen.
+ *
+ * The caller owns the value and must default it to 'casual' on every mount:
+ * the mode is per attempt and is never remembered. Nothing in here persists.
+ */
+export function RankedToggle({
+  value,
+  onChange,
+  disabled,
+  style,
+}: Styled<ViewStyle> & {
+  value: RankedMode;
+  onChange: (next: RankedMode) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <View style={[styles.rankedToggle, disabled && styles.rankedToggleOff, style]}>
+      {RANKED_MODES.map(mode => {
+        const on = value === mode;
+        const ranked = mode === 'ranked';
+        return (
+          <Pressable
+            key={mode}
+            onPress={disabled ? undefined : () => onChange(mode)}
+            disabled={disabled}
+            accessibilityRole="button"
+            accessibilityState={{ selected: on, disabled: Boolean(disabled) }}
+            accessibilityLabel={
+              ranked
+                ? 'Ranked: this bout moves your rank'
+                : 'Casual: real stake, no rank change'
+            }
+            style={[
+              styles.rankedOpt,
+              on && (ranked ? styles.rankedOptOnRanked : styles.rankedOptOn),
+            ]}
+          >
+            {ranked ? (
+              <Icon
+                name="trophy"
+                size={13}
+                color={on ? colors.onAccent : colors.dim}
+              />
+            ) : null}
+            <Text
+              style={[
+                styles.rankedText,
+                on && (ranked ? styles.rankedTextOnRanked : styles.rankedTextOn),
+              ]}
+            >
+              {RANKED_LABEL[mode]}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+/**
+ * The after-the-fact marker: a small pill saying a bout was ranked. Shown on
+ * pre-bout and results screens so "did that one count?" is never a question
+ * the fighter has to reconstruct from their MMR moving.
+ *
+ * Casual renders a pill too, rather than nothing. An absent badge would be
+ * indistinguishable from a screen built before badges existed, and the
+ * ambiguity the badge exists to remove is exactly that one.
+ */
+export function RankedBadge({
+  mode,
+  onAccent,
+  style,
+}: Styled<ViewStyle> & { mode: RankedMode; onAccent?: boolean }) {
+  const ranked = mode === 'ranked';
+  const fg = onAccent
+    ? ranked
+      ? colors.onAccent
+      : colors.onAccentMuted
+    : ranked
+      ? colors.accent
+      : colors.secondary;
+  const bg = onAccent
+    ? colors.onAccentGhost
+    : ranked
+      ? colors.accentTint
+      : colors.raised;
+  return (
+    <View style={[styles.rankedBadge, { backgroundColor: bg }, style]}>
+      {ranked ? <Icon name="trophy" size={11} color={fg} /> : null}
+      <Text style={labelStyle(9, fg, 0.14)}>{RANKED_LABEL[mode]}</Text>
+    </View>
+  );
+}
+
 /** The spots-claimed bar: one segment per seat. */
 export function Slots({
   filled,
@@ -899,6 +1004,46 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
   },
   avatar: { alignItems: 'center', justifyContent: 'center' },
+  rankedToggle: {
+    flexDirection: 'row',
+    backgroundColor: colors.card,
+    borderRadius: radius.control,
+    padding: space.xs,
+    gap: space.xs,
+  },
+  rankedToggleOff: { opacity: 0.4 },
+  rankedOpt: {
+    flex: 1,
+    height: 40,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    borderRadius: radius.tile,
+  },
+  /** Casual selected is the neutral raised surface: chosen, not celebrated. */
+  rankedOptOn: { backgroundColor: colors.raised },
+  /** Ranked selected spends the accent, because it is the consequential one. */
+  rankedOptOnRanked: { backgroundColor: colors.accent },
+  rankedText: {
+    fontFamily: fonts.semibold,
+    fontSize: 12,
+    letterSpacing: 0.6,
+    color: colors.dim,
+    includeFontPadding: false,
+  },
+  rankedTextOn: { color: colors.text },
+  rankedTextOnRanked: { color: colors.onAccent },
+  rankedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 4,
+    paddingHorizontal: 7,
+    borderRadius: radius.tag,
+    alignSelf: 'flex-start',
+  },
+
   slotOn: { backgroundColor: colors.accent },
   slotOff: { backgroundColor: colors.slot },
   statRow: {

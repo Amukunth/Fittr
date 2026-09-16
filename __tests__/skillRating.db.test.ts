@@ -56,16 +56,33 @@ afterEach(async () => {
 
 type Exercise = 'pushups' | 'plank' | 'wallsit';
 
+// Ranked by default: this whole suite exercises the Elo arithmetic, which
+// only runs at all for a ranked bout since 20260916000100 — a casual queue
+// entry pairs and settles exactly like this one but writes no
+// skill_rating_events row. Ranked/casual pairing itself is covered
+// separately (see the "ranked / casual pairing" describe block below).
 function enter(
   user: string,
-  r: { exercise?: Exercise; format?: '1v1' | 'pooled'; stake?: number; seats?: number } = {},
+  r: {
+    exercise?: Exercise;
+    format?: '1v1' | 'pooled';
+    stake?: number;
+    seats?: number;
+    ranked?: boolean;
+  } = {},
 ) {
   const format = r.format ?? '1v1';
   return rpcRow<MatchmakingQueueRow>(
     db,
     user,
-    'SELECT * FROM enter_matchmaking($1, $2, $3, $4)',
-    [r.exercise ?? 'pushups', format, r.stake ?? 100, r.seats ?? (format === '1v1' ? 2 : 4)],
+    'SELECT * FROM enter_matchmaking($1, $2, $3, $4, $5)',
+    [
+      r.exercise ?? 'pushups',
+      format,
+      r.stake ?? 100,
+      r.seats ?? (format === '1v1' ? 2 : 4),
+      r.ranked ?? true,
+    ],
   );
 }
 
@@ -168,9 +185,13 @@ async function stage(
     );
   }
 
+  // is_ranked = true: staged bouts exist to exercise the rating arithmetic,
+  // which since 20260916000100 only runs at all for a ranked bout. Ranked/
+  // casual itself is covered separately, through enter() further up, which
+  // is what actually goes through enter_matchmaking()'s snapshot.
   const { rows: challengeRows } = await db.pool.query<{ id: string }>(
-    `INSERT INTO challenges (type, format, stake_points, max_participants, status, created_by)
-     VALUES ($1, $2, $3, $4, 'matched', $5) RETURNING id`,
+    `INSERT INTO challenges (type, format, stake_points, max_participants, status, created_by, is_ranked)
+     VALUES ($1, $2, $3, $4, 'matched', $5, true) RETURNING id`,
     [exercise, seats === 2 ? '1v1' : 'pooled', stake, seats, members[0]],
   );
   const { rows: matchRows } = await db.pool.query<{ id: string }>(

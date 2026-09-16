@@ -58,14 +58,31 @@ async function createUserWith(
   return id;
 }
 
+// Ranked by default: this suite is about the norms-seeded MMR the rating
+// step produces inside settlement, which since 20260916000100 only runs for
+// a ranked bout. A casual queue entry pairs and settles identically but
+// writes no skill_rating_events row, which is what every eventFor() call
+// below would otherwise see as null.
 function enter(
   user: string,
-  r: { exercise?: Exercise; format?: '1v1' | 'pooled'; stake?: number; seats?: number } = {},
+  r: {
+    exercise?: Exercise;
+    format?: '1v1' | 'pooled';
+    stake?: number;
+    seats?: number;
+    ranked?: boolean;
+  } = {},
 ) {
   const format = r.format ?? '1v1';
   return rpcRow<MatchmakingQueueRow>(
-    db, user, 'SELECT * FROM enter_matchmaking($1, $2, $3, $4)',
-    [r.exercise ?? 'pushups', format, r.stake ?? 100, r.seats ?? (format === '1v1' ? 2 : 4)],
+    db, user, 'SELECT * FROM enter_matchmaking($1, $2, $3, $4, $5)',
+    [
+      r.exercise ?? 'pushups',
+      format,
+      r.stake ?? 100,
+      r.seats ?? (format === '1v1' ? 2 : 4),
+      r.ranked ?? true,
+    ],
   );
 }
 

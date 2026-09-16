@@ -2045,3 +2045,467 @@ data; if they are ever purged, re-running the replay in
 
 **Not yet done: an EAS build carrying the client half.** The database is
 ready; the Rank tab does not exist on anybody's phone until one ships.
+
+## Blitz, Streak, and ranked/casual (2026-09-16)
+
+Two new solo formats and a switch that runs across every format. All three
+share one migration, `20260916000100_solo_modes_ranked_casual` (preceded by
+the enum-only `20260916000000_solo_mode_formats`, split out for the same
+"cannot use an enum value in the transaction that adds it" reason as every
+other enum-extension migration in this project — see
+`20260903200000_add_needs_review_status`).
+
+```
+blitz_runs             one solo set against three ascending thresholds
+streak_runs            up to three stages, staked once
+streak_stage_attempts  one row per stage attempt, INCLUDING buy-backs
+challenges.is_ranked   whether a bout moves skill_ratings at all
+_solo_target_for_rating()   rating -> percentile -> raw score, per exercise
+_mmr_rate_solo()       one Elo update against a virtual opponent
+settle_match()         forks to _solo_settle() for one-seat bouts
+```
+
+### The design decision: one seat, the whole existing pipeline
+
+A Blitz or Streak attempt is a `Challenge` with `max_participants = 1`,
+created already `matched` (there is no lobby to fill), running through
+`match_participants`, `verification_sessions`, the anomaly gate,
+`points_ledger_entries` and `Results` exactly like a 1v1. Two dedicated
+tables (`blitz_runs`, `streak_runs`/`streak_stage_attempts`) hold only what
+a head-to-head bout doesn't need: the calibrated thresholds, the virtual
+opponent's rating, and — for Streak — which stage a run is on.
+
+The alternative (a fully separate solo pipeline) was rejected because
+`submit_verification_session()` is the *only* path a camera result can
+reach the database by. A parallel entry point would need its own anomaly
+gate, its own `needs_review` handling, and its own place in the open-round
+guard (`_solo_start_guard()` reuses `_mm_open_round_blocks_for()`'s exact
+predicate) — three things kept in step with the 1v1 path today, and three
+things that could drift from it otherwise.
+
+### Blitz: the multiplier/MMR calibration
+
+The three tiers are **rating offsets**, not multiples of a base score:
+
+```
+_solo_blitz_tier_offsets()  {0, +150, +320}
+_solo_blitz_tier_bp()       {15000, 20000, 25000}   (1.5x / 2x / 2.5x)
+```
+
+Tier *i*'s **target** is `_solo_target_for_rating(exercise, mmr + offset_i,
+gender, age_band)` — the raw score whose population percentile (from
+`performance_norms`, the same table `20260910000000`'s placement seed
+reads) maps back to that rating, via `_solo_percentile_for_rating()` (the
+exact inverse of `_mmr_from_percentile()`) and `_perf_raw_from_anchors()`
+(the exact mirror of `_perf_percentile_from_anchors()`, with the raw/
+percentile axes swapped).
+
+This is the whole reason a rating offset was chosen over a flat multiplier
+on the fighter's median: push-ups and a plank have wildly different
+spreads (male 20s: push-ups P25=17/P50=30/P75=47, spread σ≈0.75 in log
+space; plank P25=81/P50=106/P75=130, σ≈0.19). A flat "1.75× your median"
+would be a ~1σ stretch on push-ups and a ~2.9σ stretch on a plank — the
+same printed number, a coin flip in one exercise and a once-a-year event in
+the other. Defining every tier in rating space and converting through the
+norms curve makes the *difficulty* identical by construction, because the
+curve absorbs each exercise's own spread.
+
+It also makes the virtual opponent **exact rather than invented**: the
+implied rating of a threshold *is* the rating it was calibrated from, so
+the Elo expectation against it is, by definition, the probability a
+fighter at that rating clears it —
+
+```
+E(clear tier 1) = 0.500   E(clear tier 2) = 0.297   E(clear tier 3) = 0.137
+P(land exactly tier 1) = 0.203, tier 2 = 0.160, tier 3 = 0.137, miss = 0.500
+EV per stake = 0.203·1.5 + 0.160·2.0 + 0.137·2.5 ≈ 0.97
+```
+
+(the exactly-tier probabilities come from the tier boundaries, not
+directly from the "at least" E values above). Streak's chain of three
+per-stage E-values compounds to `0.760·0.640·0.500 ≈ 0.243`, paid at 4.0x,
+for the same ~0.97 EV. **Both land just under 1.0 on purpose** — a solo
+wager that paid at or above parity would inflate the points economy with
+no second stake feeding the pot, and the ~3% shortfall is the entire
+reason a wager against yourself can exist at all.
+
+⚠️ **This EV is a model, not a measurement.** It assumes a fighter's actual
+rep/hold distribution matches the population percentile curve their rating
+sits on — the same assumption `20260910000000`'s placement seed already
+makes, and just as unverified against a real set. See "What is NOT
+verified" below.
+
+Two more calibration details worth knowing:
+
+- **Rounding can collide.** Two adjacent tiers can round to the same
+  integer, most easily on a hold (5-second step) at a low rating where the
+  percentile curve is flat. `_blitz_ladder()`/`_streak_view()` force each
+  tier at least one step above the one below it, which keeps the printed
+  ladder strictly ascending (`blitz_runs_targets_ascending`,
+  `streak_runs_targets_ascending`) at the cost of making a nudged tier
+  *very* slightly harder than its nominal rating — the fighter is never
+  paid more than the bar they actually cleared, which is the right side to
+  err on.
+- **Missing demographics.** `gender`/`age_band` are optional and always
+  will be. No age band → `_solo_default_age_band()` returns `'20s'`, the
+  one band every source table is actually anchored at. No gender → the
+  target is the **mean of the male and female curves at the same
+  percentile**, not a default sex — the most that can honestly be said
+  about someone who didn't say. `calibrated_to_me` on both preview rows
+  tells the client which case it's in, and `SOLO_CALIBRATION_ROUGH` in
+  `src/theme/copy.ts` is the copy that results.
+
+### The virtual-opponent rating approach
+
+`_mmr_rate_solo()` is `_mmr_rate_match()`'s N=1 case, stated as its own
+function rather than a special case inside the group-battle loop:
+
+```sql
+v_k := placement_complete ? K_settled : K_placement;   -- same schedule
+v_s := cleared ? 1 : 0;                                -- win/loss, no ties
+v_delta := round(v_k * (v_s - _mmr_expected(mmr, opponent_rating)));
+v_after := greatest(_mmr_floor(), mmr + v_delta);      -- same floor
+-- one skill_rating_events row, participants = 1
+```
+
+Everything is the *same* Elo as a 1v1 — same `_mmr_expected()`, same K
+schedule, same floor, same event table — because the point of a virtual
+opponent is that a solo result is commensurable with a head-to-head one:
+clearing your own bar gains what beating an equal opponent gains.
+
+What's different, and deliberately:
+
+- **`participants = 1`** on the event row, not padded to 2. There is no
+  `(N−1)` divisor to apply (division by 1 is a no-op in any case), and the
+  column records the truth about the bout.
+- **The opponent's rating never moves.** It isn't a rating, it's a bar — no
+  `skill_ratings` row exists for it and none is written to.
+- **Blitz always rates off `tier1_rating`**, never the top tier actually
+  reached. Rating the top tier instead would make Blitz the one place
+  margin of victory is weighted — see "Deliberately not built" under the
+  original skill-rating section; this project has never done that anywhere
+  else, and Blitz doesn't start.
+- **A Streak stage rates off *that stage's own* rating** — stage 3's
+  offset is zero, so the last stage of a run is, rating-wise, a fight
+  against your unmodified self.
+- **One update per attempt, including retries.** `_mmr_rate_solo()` is
+  called once per settled match, and a Streak buy-back opens a new match
+  (`streak_stage_attempts` gets a new row, `attempt_no` incremented) — so
+  "one Elo update per stage attempt, including retries" falls out of the
+  one-attempt-one-match design rather than needing a separate counter.
+
+### The ranked/casual data model
+
+One column, `challenges.is_ranked`, snapshotted onto `matchmaking_queue`
+for pairing and read straight off the challenge row at settlement:
+
+```
+enter_matchmaking(..., p_is_ranked boolean DEFAULT false)
+blitz_start(..., p_is_ranked boolean DEFAULT false)
+streak_start(..., p_is_ranked boolean DEFAULT false)
+```
+
+**Casual is the default everywhere** — the column default, every RPC's
+default, and the client's initial state on every screen that starts an
+attempt (`FindBoutScreen`, `BlitzPreScreen`, `StreakPreScreen` all call
+`setMode('casual')` on mount/focus, never read a persisted value). Ranked
+requires an explicit tap on `RankedToggle`, every single time.
+
+**Ranked and casual are two separate matchmaking pools.** `_mm_find_lobby()`
+gained `AND c.is_ranked = p_is_ranked` alongside its existing exercise/
+format/seats/stake predicate — a casual search cannot fill a ranked lobby
+or vice versa, because a bout cannot be half-rated. The advisory-lock
+domain key (`_mm_domain_key()`) was deliberately **not** split the same
+way: it still hashes only `(exercise, format, seats)`, so the ranked and
+casual pools for one domain serialise against the same lock. That's
+slightly more contention than necessary and is the right trade — the key
+is recomputed from a queue row in four separate call sites, and a key that
+could disagree with itself across them would be a silent correctness bug,
+not a slow one.
+
+**What casual skips, and what it doesn't.** The spec is exactly: casual
+"does not affect MMR, matches_played, or placement" — the three columns of
+`skill_ratings`. So `settle_match()` and `_solo_settle()` gate exactly one
+call each behind `is_ranked`: `_mmr_rate_match()` / `_mmr_rate_solo()`. A
+casual bout writes **no** `skill_ratings` row, **no**
+`skill_rating_events` row, and doesn't increment `matches_played` — which
+is what keeps it out of the five-bout placement count too, since placement
+is derived from that same counter.
+
+`_rank_apply_match()` — trophies, `total_wins`/`total_losses`/`total_ties`,
+`current_streak`, `rank_history` — is **NOT** gated on `is_ranked`, and
+runs for a solo attempt not at all (see below). That is a defensible
+reading of the spec ("does not affect MMR, matches_played, or placement" —
+three specific things, not "the trophy ladder too") and it is not the only
+possible one; flipping it is a single `IF v_challenge.is_ranked` wrapped
+around the one `_rank_apply_match()` call inside `settle_match()`. Called
+out explicitly so the decision is visible rather than assumed. See "Why two
+ladders is not one ladder too many" further up this file for what the two
+ladders are for.
+
+**Solo attempts get neither ladder.** `_solo_settle()` calls
+`_mmr_rate_solo()` (gated on `is_ranked`, same as above) but never calls
+`_rank_apply_match()` at all — a bar you set for yourself is not a person,
+and the trophy ladder is specifically the record of beating people. This
+*is* a product decision (not implied by the ranked/casual spec, which is
+silent on trophies for solo modes) and it's the one most likely to be
+revisited; flipping it needs a `winners` array shaped for one seat, not
+just an `IF`.
+
+**Placement.** "Only ranked attempts count toward the existing 5-bout
+placement requirement" is true by construction, not by a separate check:
+`matches_played` only increments inside `_mmr_rate_match()` /
+`_mmr_rate_solo()`, both of which only run for `is_ranked = true`. A
+fighter who plays ten casual bouts and then one ranked one is still
+unplaced after that first ranked bout — 1 of 5 — exactly as if the ten
+casual ones never happened, because as far as placement is concerned, they
+didn't.
+
+**Backfill.** Every already-`matched`/`completed`/`needs_review` challenge
+at migration time was backfilled to `is_ranked = true` (it already *had*
+moved a rating, so it has to keep reading as ranked forever — the Results
+screen's badge is not allowed to retroactively change what a settled bout
+counted for). A live `open` lobby was left at the new column's default,
+`false`: at deploy time it's a search in flight with no ranked/casual
+opinion of its own, and the alternative (`true` on the lobby, `false` on
+its queue rows) would strand it against a pairing predicate it could never
+satisfy. It either fills normally under the casual default or expires on
+the ordinary 20-second TTL, same as any other stale search.
+
+### The two Streak timers — same duration, not the same clock
+
+Both are five hours; that's the only thing they share.
+
+```
+_streak_buyback_window()   5h from streak_runs.failed_at
+                            While open: streak_buy_back_in() may retry
+                            THE FAILED STAGE, for another stake, without
+                            losing any earlier stage.
+                            Once closed: the run is spent. The NEXT call to
+                            streak_start() begins a brand new run at stage 1,
+                            calibrated fresh against whatever the fighter's
+                            rating is by then.
+
+_streak_win_cooldown()     5h from streak_runs.completed_at
+                            While open: streak_start() refuses outright
+                            ('streak_cooldown') for that exercise. Every
+                            OTHER mode (1v1, pooled, Blitz, the other two
+                            exercises' Streak) is unaffected.
+                            A FAILED run has no cooldown at all — only the
+                            buy-back window above applies to it.
+```
+
+Neither deadline is **stored**. `streak_preview()` (via `_streak_view()`,
+shared by every Streak RPC so the state machine is decided in exactly one
+place) computes `buyback_until`/`cooldown_until` from the anchor timestamp
+at read time, and derives `state` — `'idle' | 'active' | 'failed' |
+'expired' | 'cooldown'` — from *that*, not from a fourth stored status
+value. `'expired'` and `'cooldown'` are the same underlying row
+(`status = 'failed'` / `status = 'won'`) read against a clock that has run
+out; changing either tunable therefore re-judges every live run
+immediately, with no migration and no cron needed to "expire" anything.
+
+**`failed_at` is deliberately not cleared by a buy-back.** `streak_runs`
+holds only the most recent failure; `streak_stage_attempts` is the full
+history (`attempt_no` per stage, `is_buy_back` marking which ones cost a
+stake). If a bought-back attempt fails *again*, `_solo_settle()`
+overwrites `failed_at`/`failed_stage` with the new failure — the window
+**re-anchors** to it rather than inheriting whatever was left of the old
+one. Asserted directly in `soloModes.db.test.ts` ("re-anchors failed_at
+when a bought-back attempt fails again").
+
+Both timestamps are rendered client-side against `streak_preview()`'s own
+`server_now`, never against `Date.now()` (see `remainingMs()` in
+`src/lib/soloModes.ts` and `useCountdown()`, which measures elapsed
+*screen* time via `Date.now()` differences and lets the server's own clock
+carry the absolute deadline) — a phone with a skewed clock sees the real
+remaining time instead of its own opinion of it.
+
+### Stage-persistence behaviour
+
+A run's `current_stage` only advances on a **clear**, inside
+`_solo_settle()`; nothing else moves it. Concretely:
+
+- Clearing stage 1 or 2 sets `current_stage = current_stage + 1` and stops
+  — it does **not** open the next stage's camera round.
+  `streak_next_stage(run_id)` is a separate RPC the client calls only when
+  the fighter taps the "start stage N" button on the stage-cleared screen
+  (`StreakRunScreen`'s middle state). Folding the two together would drop
+  a fighter into a live staked round while they were still reading the
+  number they'd just hit.
+- Clearing stage 3 pays out, sets `status = 'won'`, and leaves
+  `current_stage` at 3.
+- Failing any stage sets `status = 'failed'` and leaves `current_stage`
+  **unchanged** — this is the literal mechanism behind "retrying the same
+  stage without losing progress": a buy-back re-opens a round for
+  whatever `current_stage` already says, and every earlier stage's cleared
+  attempt is still sitting in `streak_stage_attempts`, untouched.
+- `streak_stage_attempts_one_open_per_run` (a partial unique index on
+  `run_id WHERE settled_at IS NULL`) makes "one live camera round per run"
+  a database fact, not an app-level promise — `streak_next_stage()` is
+  written to be idempotent against a double tap for exactly this reason
+  (it returns the existing open attempt instead of trying to insert a
+  second one, which the index would reject anyway).
+- `streak_runs_one_active_per_exercise` (partial unique on `(user_id,
+  exercise_type) WHERE status = 'active'`) makes "the run that matters"
+  well-defined even against two devices racing `streak_start()` — the
+  app-level guard in `streak_start()` is real (and fires first, as
+  `round_open`, if a camera round happens to be open at that exact
+  moment), but the index is what actually prevents two active rows,
+  independent of whether the guard was reached at all. Both paths are
+  exercised directly in `soloModes.db.test.ts`.
+
+### Lock order — appended at the same end as every prior addition
+
+```
+lobby `challenges` row -> member `matchmaking_queue` rows
+  -> `fitness_profiles` rows ORDER BY user_id
+  -> `skill_ratings` rows ORDER BY user_id
+  -> [new] blitz_runs / streak_runs / streak_stage_attempts
+```
+
+A solo attempt has exactly one of each row in the chain, so it cannot
+deadlock against itself. `blitz_start()`/`streak_start()`/
+`streak_buy_back_in()` take the one `fitness_profiles` row `FOR UPDATE`
+(to debit a stake) and nothing else; `_solo_settle()` takes
+`fitness_profiles` then `skill_ratings`, in that order, exactly as the 1v1
+settlement path does. Nothing else ever locks a `blitz_runs`/
+`streak_runs`/`streak_stage_attempts` row, and nothing they lock is taken
+again afterward.
+
+### Screens
+
+Two new pre-bout screens and one new "what happened" screen, all reached
+from `FindBoutScreen`'s format picker (now five options: `1v1`, `pooled`,
+`blitz`, `streak`, and the still-unbuilt `Bracket` placeholder):
+
+- **`BlitzPreScreen`** (new) — the calibrated ladder, the stake picker, the
+  ranked/casual toggle, one `blitz_preview()` read and one `blitz_start()`
+  write. Nothing is staked until START.
+- **`StreakPreScreen`** (new) — the mode's one front door. Renders all five
+  `streak_preview()` states: `idle` (three stages + stake + toggle),
+  `active` (resume), `failed` (buy-back offered, countdown visible even
+  from *this* screen, not only from `StreakRunScreen`), `expired` (says a
+  fresh run starts at stage 1), `cooldown` (**locked and visibly
+  countdown-shown**, never hidden — see the spec's own requirement 2).
+- **`StreakRunScreen`** (new) — where a stage attempt lands after the
+  camera: cleared (brief transition + "start next stage" button),
+  failed (buy-back CTA + live countdown, reachable from the failure itself
+  or later from `StreakPreScreen`), won (payout/celebration, distinct
+  watermark and copy from the 1v1 win screen, cooldown timer shown inline).
+  Keyed on **run id**, not match id — all three states are facts about the
+  run, and the run outlives any one stage's match.
+- **`MatchInProgressScreen`** (modified) — reads the challenge's `format`
+  and, for a solo bout, the run's snapshot (`blitz_runs` or the
+  `streak_stage_attempts` row + its `streak_runs` parent) alongside the
+  existing challenge/participant reads. The opponent strip is replaced by
+  a bar strip (which tier is banked / which stage is being chased); a new
+  progress line under the live counter shows the next threshold and a row
+  of tier pips for Blitz. On submit, a solo round routes straight to its
+  own result screen (`Results` for Blitz, `StreakRun` for a Streak stage)
+  rather than through the shared "no decision yet" pending state, since a
+  one-seat bout settles the instant it's recorded — there's no field to
+  wait on.
+- **`ResultsScreen`** (modified) — forks to a new `BlitzResult` component
+  (the ladder with the cleared rung marked, distinct win/loss framing from
+  a 1v1) when the challenge is a settled Blitz; redirects (`replace`) a
+  Streak stage's match straight to `StreakRun`, since everything a fighter
+  needs after one is a fact about the run, not the match. Every kind
+  screen (win/loss/tie/pending/review) now shows a `RankedBadge`.
+- **`FindBoutScreen`** (modified) — Blitz/Streak push their own pre-bout
+  screens instead of staking through this one; the stake picker and
+  `RankedToggle` hide for a solo format (its own screen owns both).
+- **`SearchingScreen`** (modified) — shows a `RankedBadge` next to the
+  format tag, so the pool a live search is in is visible while waiting,
+  not only after.
+
+New shared primitives in `src/theme/ui.tsx`: `RankedToggle` (the two-way
+switch, Casual first and selected) and `RankedBadge` (the after-the-fact
+pill, rendered for casual too — an absent badge would be indistinguishable
+from a screen that predates badges, which is exactly the ambiguity a badge
+exists to remove).
+
+### Testing
+
+`__tests__/soloModes.test.ts` — pure client logic, no database: multiplier/
+target formatting, `tierReachedFor()`/`nextTierFor()` against a hand-built
+ladder, both countdown helpers (including that `remainingMs()` never goes
+negative and correctly subtracts elapsed screen time), and every stable
+error code `soloErrorCopy()` maps.
+
+`__tests__/soloModes.db.test.ts` — against the same embedded-Postgres
+harness every other `.db.test.ts` uses: the calibration round-trips
+(rating → target → rating, within the same rounding tolerance
+`_mmr_seed_from_norms()`'s own round-trip is held to), `blitz_preview`/
+`blitz_start`/settlement across all four tiers (0 through 3) including that
+margin above a tier doesn't change the rating move, a casual Blitz paying
+identically while rating nothing, the anomaly-hold-and-clear path, a full
+three-stage Streak win (three separate `skill_rating_events` rows, one per
+stage attempt), the win cooldown blocking and then releasing a fresh
+`streak_start()`, a failure preserving `current_stage` while charging
+nothing extra, buy-back-in re-charging the stake and preserving progress,
+the buy-back window actually expiring (`streak_buy_back_in` rejected,
+`streak_preview` reporting `'expired'`), `failed_at` re-anchoring on a
+second failure, the ranked/casual matchmaking pools genuinely not pairing
+with each other, `enter_matchmaking` rejecting a solo format outright, a
+casual 1v1 settling fully while writing no rating row (trophies still move
+— the other-ladder assertion), and that the RLS/grant surface (`blitz_runs`/
+`streak_runs`/`streak_stage_attempts`) matches every other rating table's
+own-rows-only, no-client-write shape.
+
+`__tests__/skillRating.db.test.ts` and `__tests__/performanceNorms.db.test.ts`
+needed one change each: their `enter()`/`stage()` test helpers now pass
+`p_is_ranked = true` explicitly (via a new fifth `enter_matchmaking`
+argument, or a direct `is_ranked = true` column on a hand-staged
+challenge). Both suites are specifically exercising the Elo/norms
+arithmetic, which since this migration only runs at all for a ranked bout
+— a fighter who forgot to opt in the way these helpers used to would
+previously have been silently rated regardless; now they wouldn't be, and
+the suites had to say so explicitly rather than relying on it happening by
+default.
+
+### ⚠️ What is NOT verified
+
+- **The EV model.** Every "just under 1.0" number above assumes a
+  fighter's actual score distribution matches the population percentile
+  curve their rating sits on — untested against any real attempt. If real
+  play skews easier or harder than the norms table implies, the house edge
+  moves with it, in either direction.
+- **No real attempts have been played.** Every number in this section
+  comes from `soloModes.db.test.ts` calling the RPCs directly against a
+  synthetic Postgres — never through `submit_verification_session()` fed
+  by an actual camera session, never on a real phone, never through
+  PostgREST. The camera HUD additions to `MatchInProgressScreen` (the tier
+  pips, the "next tier at X" progress line, the stage/bar strip) are typed
+  and unit-testable in isolation but have not been seen rendering live
+  against real `onUpdate` events.
+- **Rounding-collision nudging** (`_blitz_ladder()`/`_streak_view()`
+  forcing an adjacent tier at least one step above the one below) is
+  exercised only at the ratings the calibration test picks, not swept
+  across the full rating range — a low-rated fighter on a coarse-stepped
+  exercise (wall-sit, 5-second steps, at a rating where the percentile
+  curve is nearly flat) is the scenario most likely to collide and least
+  likely to have been hit by the current tests.
+- **Deliberately not built:** a Bracket format (still a placeholder label
+  in `FindBoutScreen`), a solo mode contributing to the trophy ladder (see
+  "Solo attempts get neither ladder" above), and a UI affordance for
+  starting a Streak run at a stage other than 1 after an *expired* buy-back
+  — the spec is explicit that this restarts at stage 1, and that's what's
+  built, but there's no "are you sure you want to lose the old progress"
+  confirmation on the way there, because by the time the window has
+  closed there's nothing left to confirm losing.
+
+### Deploy status: NOT yet applied
+
+Everything in this section has been verified against the embedded-Postgres
+test harness only (324/324 tests passing, `tsc --noEmit` and `eslint` both
+clean). **`20260916000000_solo_mode_formats` and
+`20260916000100_solo_modes_ranked_casual` have not been run against the
+live Supabase project.** Blitz, Streak and the ranked/casual toggle will
+not function against production — every new RPC (`blitz_preview`,
+`blitz_start`, `streak_preview`, `streak_start`, `streak_next_stage`,
+`streak_buy_back_in`) and the changed signature of `enter_matchmaking`
+simply won't exist there — until `npm run db:deploy` is run and verified
+the way every prior migration in this file was: independent introspection
+against the live database, not just the CLI's exit code, per the standing
+rule in "Migration status: applied" above.

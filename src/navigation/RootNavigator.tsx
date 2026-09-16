@@ -11,6 +11,9 @@ import { OnboardingScreen } from '../screens/OnboardingScreen';
 import { HomeScreen } from '../screens/HomeScreen';
 import { FindBoutScreen } from '../screens/FindBoutScreen';
 import { SearchingScreen } from '../screens/SearchingScreen';
+import { BlitzPreScreen } from '../screens/BlitzPreScreen';
+import { StreakPreScreen } from '../screens/StreakPreScreen';
+import { StreakRunScreen } from '../screens/StreakRunScreen';
 import { MatchInProgressScreen } from '../screens/MatchInProgressScreen';
 import { ResultsScreen } from '../screens/ResultsScreen';
 import { RankScreen } from '../screens/RankScreen';
@@ -115,6 +118,25 @@ export function RootNavigator() {
             <Stack.Screen
               name="Searching"
               component={SearchingScreen}
+              options={{ gestureEnabled: false }}
+            />
+            {/*
+              The two solo set-up screens. Ordinary pushes with the default
+              slide and the default back-swipe: unlike Searching, nothing is
+              staked and nothing is running while they are open, so backing
+              out of one needs no interception at all.
+            */}
+            <Stack.Screen name="BlitzPre" component={BlitzPreScreen} />
+            <Stack.Screen name="StreakPre" component={StreakPreScreen} />
+            {/*
+              No back-swipe: this screen is reached by `replace` from the
+              camera with a stake already spent, and its states (buy back in,
+              start the next stage) are the only sensible ways forward. A
+              gesture back to a set-up screen would offer to stake again.
+            */}
+            <Stack.Screen
+              name="StreakRun"
+              component={StreakRunScreen}
               options={{ gestureEnabled: false }}
             />
             <Stack.Screen

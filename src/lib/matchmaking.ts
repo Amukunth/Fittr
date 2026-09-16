@@ -87,6 +87,11 @@ export function enterMatchmaking(
     p_format: req.format,
     p_stake_points: req.stake,
     p_max_participants: req.maxParticipants,
+    // Always sent, never omitted. The server defaults it to casual, but a
+    // client that left it out would be relying on that default to mean what
+    // the toggle said -- and ranked and casual are separate pools, so getting
+    // it wrong does not merely mis-rate a bout, it searches the wrong queue.
+    p_is_ranked: req.mode === 'ranked',
   });
 }
 
@@ -142,6 +147,9 @@ export function enterErrorCopy(error: string): string {
   }
   if (error.includes('exercise_not_available')) {
     return "That exercise isn't on the card yet.";
+  }
+  if (error.includes('format_not_queueable')) {
+    return 'Blitz and Streak are solo — there is nothing to queue for.';
   }
   if (error.includes('profile_required')) {
     return 'Set up your profile before your first bout.';

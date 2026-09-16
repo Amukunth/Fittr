@@ -57,9 +57,28 @@ enum ChallengeType {
   race
 }
 
+/// `blitz` and `streak` are SOLO formats: one seat, no opponent, the fighter
+/// wagers against a threshold calibrated to their own MMR. They are added to
+/// this enum rather than modelled separately because a solo attempt reuses
+/// the whole existing bout pipeline -- challenge, match, participant,
+/// verification session, anomaly gate, points ledger -- with
+/// maxParticipants = 1. See 20260916000000_solo_mode_formats for why the
+/// two values had to be added in a migration of their own.
 enum ChallengeFormat {
   pooled
   one_v_one @map("1v1")
+  blitz
+  streak
+}
+
+/// Where one Streak run has got to. `failed` past its buy-back window is NOT
+/// a fourth value: "expired" is derived from failedAt at read time by
+/// streak_preview(), so changing _streak_buyback_window() re-judges every
+/// live run instead of needing a migration and a cron.
+enum StreakRunStatus {
+  active
+  failed
+  won
 }
 
 enum ChallengeStatus {
@@ -393,8 +412,17 @@ model Challenge {
   type        ChallengeType
   format      ChallengeFormat
   stakePoints Int             @map("stake_points")
-  /// Seats: 2 for 1v1 (enforced by a CHECK), 3..6 for a Group Battle.
+  /// Seats: 1 for Blitz/Streak, 2 for 1v1, 3..6 for a Group Battle. A CHECK
+  /// makes "one seat" and "a solo format" the same statement in both
+  /// directions.
   maxParticipants Int         @default(2) @map("max_participants")
+  /// Whether this bout moves skill_ratings. Casual (the default, everywhere)
+  /// is otherwise a completely real bout: same stakes, same camera, same
+  /// anomaly gate, same pot. It simply writes no SkillRating and no
+  /// SkillRatingEvent, which is also what keeps it out of placement.
+  /// Trophies and the W/L record are NOT gated on this -- see BACKEND.md,
+  /// "What casual does and does not touch".
+  isRanked    Boolean         @default(false) @map("is_ranked")
   status      ChallengeStatus @default(open)
   createdById String          @map("created_by") @db.Uuid
   createdAt   DateTime        @default(now()) @map("created_at")
@@ -433,6 +461,11 @@ model MatchmakingQueueEntry {
   /// bout settling elsewhere cannot re-band a live search.
   mmr             Int               @default(1000)
   placementComplete Boolean         @default(false) @map("placement_complete")
+  /// Snapshotted from the request. Ranked and casual are two separate pools:
+  /// _mm_find_lobby() only admits a fighter to a lobby with the same flag,
+  /// because a bout cannot be half-rated. A CHECK keeps the solo formats off
+  /// this table entirely -- nothing queues for a bout with one seat.
+  isRanked        Boolean           @default(false) @map("is_ranked")
   status          MatchmakingStatus @default(searching)
   /// The lobby this entry is provisionally seated in.
   challengeId     String?           @map("challenge_id") @db.Uuid
@@ -482,6 +515,10 @@ model Match {
   queueEntries  MatchmakingQueueEntry[]
   ratingEvents  SkillRatingEvent[]
   rankEvents    RankHistoryEntry[]
+  /// Set only on a one-seat Blitz match.
+  blitzRun      BlitzRun?
+  /// Set only on a one-seat Streak match, one per stage attempt.
+  streakAttempt StreakStageAttempt?
 
   @@map("matches")
 }
@@ -518,6 +555,162 @@ model VerificationSession {
   createdAt          DateTime         @default(now()) @map("created_at")
 
   @@map("verification_sessions")
+}
+
+/// One Blitz attempt: a solo set against three ascending thresholds, each
+/// calibrated to the fighter's MMR for that exercise at the moment the run
+/// started. Written only by blitz_start() and _solo_settle(), both SECURITY
+/// DEFINER; readable by its owner and by nobody else, with no client INSERT
+/// or UPDATE grant at all -- a client that could write its own thresholds
+/// could set them to one rep.
+///
+/// Every target, virtual-opponent rating and multiplier is SNAPSHOTTED here
+/// at start. Settlement reads the snapshot and never recalibrates, for the
+/// same reason MatchmakingQueueEntry snapshots its mmr: a bout settling
+/// elsewhere can move the rating mid-run, and the bar has to be the one the
+/// fighter was shown.
+model BlitzRun {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String        @map("user_id") @db.Uuid
+  /// 1:1 with the one-seat Match this run is fought on. The camera round,
+  /// the verification session, the anomaly gate and both ledger entries all
+  /// hang off that match, exactly as they do for a 1v1.
+  matchId      String        @unique @map("match_id") @db.Uuid
+  match        Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  exerciseType ChallengeType @map("exercise_type")
+  stakePoints  Int           @map("stake_points")
+  isRanked     Boolean       @map("is_ranked")
+  /// The rating the whole ladder was calibrated from, and the rating tier
+  /// 1's virtual opponent is.
+  mmrAtStart   Int           @map("mmr_at_start")
+
+  /// Strictly ascending (CHECK). Reps for pushups, seconds for a hold.
+  tier1Target  Int           @map("tier1_target")
+  tier2Target  Int           @map("tier2_target")
+  tier3Target  Int           @map("tier3_target")
+  /// mmrAtStart + _solo_blitz_tier_offsets()[i]: the implied rating of each
+  /// threshold, stored so a later change to the offsets cannot re-rate a run
+  /// that is already in flight.
+  tier1Rating  Int           @map("tier1_rating")
+  tier2Rating  Int           @map("tier2_rating")
+  tier3Rating  Int           @map("tier3_rating")
+  /// Basis points of the stake: 15000 / 20000 / 25000 = 1.5x / 2x / 2.5x.
+  /// Integer basis points rather than a numeric multiplier so a payout is
+  /// integer arithmetic end to end.
+  tier1Bp      Int           @map("tier1_bp")
+  tier2Bp      Int           @map("tier2_bp")
+  tier3Bp      Int           @map("tier3_bp")
+
+  /// All four NULL until settlement, all four populated after it (CHECK).
+  score        Int?
+  /// 0..3. Zero means the first threshold was missed: the stake is gone and
+  /// there is no payout ledger row at all.
+  tierReached  Int?          @map("tier_reached")
+  multiplierBp Int?          @map("multiplier_bp")
+  payoutPoints Int?          @map("payout_points")
+
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  settledAt    DateTime?     @map("settled_at") @db.Timestamptz(6)
+
+  @@index([userId, createdAt(sort: Desc)], map: "blitz_runs_user_id_created_at_idx")
+  @@map("blitz_runs")
+}
+
+/// One Streak run: up to three stages, staked once at the start, each stage
+/// its own calibrated target and its own camera round.
+///
+/// TWO SEPARATE FIVE-HOUR TIMERS hang off this row and must not be confused:
+///   failedAt    + _streak_buyback_window() -- how long streak_buy_back_in()
+///                 can retry the failed stage for another stake.
+///   completedAt + _streak_win_cooldown()   -- how long streak_start()
+///                 refuses after a WIN.
+/// Neither deadline is stored; both are computed from their anchor at read
+/// time by streak_preview(). See BACKEND.md.
+///
+/// The hand-written migration adds a partial unique index Prisma cannot
+/// express -- (userId, exerciseType) WHERE status = 'active' -- which is
+/// what makes "the run that matters" a well-defined question even against a
+/// race that streak_start()'s own guard would lose.
+model StreakRun {
+  id           String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String          @map("user_id") @db.Uuid
+  exerciseType ChallengeType   @map("exercise_type")
+  /// What one attempt costs: the opening stake, and what a buy-back costs
+  /// again. Fixed for the life of the run.
+  stakePoints  Int             @map("stake_points")
+  isRanked     Boolean         @map("is_ranked")
+  mmrAtStart   Int             @map("mmr_at_start")
+
+  /// Strictly ascending (CHECK), snapshotted at start.
+  stage1Target Int             @map("stage1_target")
+  stage2Target Int             @map("stage2_target")
+  stage3Target Int             @map("stage3_target")
+  /// mmrAtStart + _solo_streak_stage_offsets()[i]. Stage 3's offset is zero,
+  /// so the last stage of a run is a fight against your own rating.
+  stage1Rating Int             @map("stage1_rating")
+  stage2Rating Int             @map("stage2_rating")
+  stage3Rating Int             @map("stage3_rating")
+  /// Basis points of the INITIAL stake paid for clearing all three. A
+  /// buy-back does not raise it, so every retry comes out of the same purse.
+  payoutBp     Int             @map("payout_bp")
+
+  status       StreakRunStatus @default(active)
+  /// The stage a buy-back retries and streak_next_stage() opens. Never past
+  /// 3: a won run stays at 3.
+  currentStage Int             @default(1) @map("current_stage")
+  /// Opening stake plus one per buy-back. Total cost is stakePoints *
+  /// stakesPaid, which is what the UI shows against the payout.
+  stakesPaid   Int             @default(1) @map("stakes_paid")
+
+  /// Set on every failure and deliberately NOT cleared by a buy-back: the
+  /// attempts below are the history, and leaving it set means a run that
+  /// fails again re-anchors its window rather than inheriting the old one.
+  failedStage  Int?            @map("failed_stage")
+  failedAt     DateTime?       @map("failed_at") @db.Timestamptz(6)
+  completedAt  DateTime?       @map("completed_at") @db.Timestamptz(6)
+  payoutPoints Int?            @map("payout_points")
+
+  createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime        @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  attempts     StreakStageAttempt[]
+
+  @@index([userId, exerciseType, createdAt(sort: Desc)], map: "streak_runs_user_exercise_created_at_idx")
+  @@map("streak_runs")
+}
+
+/// One go at one stage, INCLUDING every buy-back. Each carries its own
+/// one-seat Match, so each gets its own camera round, its own verification
+/// session and -- when the run is ranked -- its own Elo update. That is what
+/// "one rating update per stage attempt, including retries" means in
+/// practice: there is nothing extra to arrange, because an attempt already
+/// is a match.
+///
+/// The migration adds a second partial unique index Prisma cannot express --
+/// (runId) WHERE settledAt IS NULL -- so a client that called
+/// streak_next_stage() twice cannot open two rounds against one stage.
+model StreakStageAttempt {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  runId      String    @map("run_id") @db.Uuid
+  run        StreakRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  stage      Int
+  /// 1 for the first go at this stage, 2+ for each buy-back into it.
+  attemptNo  Int       @map("attempt_no")
+  matchId    String    @unique @map("match_id") @db.Uuid
+  match      Match     @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  /// Whether a stake was charged for this attempt: true for every buy-back,
+  /// false for stage 1 (covered by the opening stake) and for advancing into
+  /// stages 2 and 3.
+  isBuyBack  Boolean   @default(false) @map("is_buy_back")
+
+  score      Int?
+  passed     Boolean?
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  settledAt  DateTime? @map("settled_at") @db.Timestamptz(6)
+
+  @@unique([runId, stage, attemptNo])
+  @@index([runId], map: "streak_stage_attempts_run_id_idx")
+  @@map("streak_stage_attempts")
 }
 
 model PointsLedgerEntry {

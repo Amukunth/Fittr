@@ -1,11 +1,16 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { useFocusEffect } from '@react-navigation/native';
 import { useBoutHistory } from '../hooks/useBoutHistory';
 import { useFitnessProfile } from '../hooks/useFitnessProfile';
 import { compactPoints, fmtPoints } from '../lib/format';
 import type { RootStackParamList } from '../navigation/types';
-import type { ChallengeFormat, ChallengeType } from '../types/database';
+import type {
+  ChallengeFormat,
+  ChallengeType,
+  RankedMode,
+} from '../types/database';
 import { TabBar } from '../components/TabBar';
 import {
   EXERCISE_ICON,
@@ -13,9 +18,11 @@ import {
   FORMAT_NAME,
   FORMAT_NOTE,
   GROUP_SIZES,
+  RANKED_NOTE,
   STAKE_OPTIONS,
   UNIT,
   VERIFIABLE_TYPES,
+  isSoloFormat,
 } from '../theme/copy';
 import { Icon } from '../theme/icons';
 import { colors, fonts, label, radius, space, typography } from '../theme/tokens';
@@ -28,16 +35,25 @@ import {
   Notice,
   Numeral,
   PageHead,
+  RankedToggle,
 } from '../theme/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'FindBout'>;
 
 const TYPES: ChallengeType[] = ['pushups', 'plank', 'wallsit', 'race'];
-const FORMATS: ChallengeFormat[] = ['1v1', 'pooled'];
-/** In the design, not in the schema. Shown so the shape of the control matches. */
-const LATER_FORMATS = ['Blitz', 'Bracket'];
+/**
+ * Every format, in the order the design lays the segmented control out. The
+ * first two queue for an opponent; Blitz and Streak are solo and are set up
+ * on their own pre-bout screens, because a stake is only half of what they
+ * need — the other half is seeing the calibrated bar before agreeing to it.
+ */
+const FORMATS: ChallengeFormat[] = ['1v1', 'pooled', 'blitz', 'streak'];
+/** Still in the design and still not in the schema. */
+const LATER_FORMATS = ['Bracket'];
 /** A 1v1 is always two seats; only a Group Battle has a size to choose. */
 const HEAD_TO_HEAD_SEATS = 2;
+/** A solo format has one seat and no pot beyond the fighter's own stake. */
+const SOLO_SEATS = 1;
 const DEFAULT_GROUP_SIZE = 4;
 /**
  * Mirrors `_mm_open_round_blocks_for()` in the matchmaking migration: a bout
@@ -59,6 +75,19 @@ export function FindBoutScreen({ navigation }: Props) {
   const [format, setFormat] = useState<ChallengeFormat>('1v1');
   const [groupSize, setGroupSize] = useState<number>(DEFAULT_GROUP_SIZE);
   const [stake, setStake] = useState<number>(250);
+  /**
+   * Ranked or casual, for the NEXT search only. This is a tab screen, so it
+   * stays mounted for the life of the app -- which is exactly why it is reset
+   * on focus below rather than merely initialised here. "Never remembered
+   * from last time" has to survive the fighter coming back to this screen.
+   */
+  const [mode, setMode] = useState<RankedMode>('casual');
+
+  useFocusEffect(
+    useCallback(() => {
+      setMode('casual');
+    }, []),
+  );
 
   const balance = profile?.points_balance ?? null;
   const affordable = (value: number) => balance === null || value <= balance;
@@ -80,9 +109,17 @@ export function FindBoutScreen({ navigation }: Props) {
     );
   }, [stats]);
 
-  const canFind = verifiable && affordable(stake) && openRound === null;
+  const solo = isSoloFormat(format);
+  // A solo format stakes nothing here -- its own screen owns the stake -- so
+  // affordability is that screen's question, not this one's.
+  const canFind =
+    verifiable && openRound === null && (solo || affordable(stake));
 
-  const players = format === '1v1' ? HEAD_TO_HEAD_SEATS : groupSize;
+  const players = solo
+    ? SOLO_SEATS
+    : format === '1v1'
+      ? HEAD_TO_HEAD_SEATS
+      : groupSize;
   const sizeIndex = GROUP_SIZES.indexOf(groupSize);
   const atMin = sizeIndex <= 0;
   const atMax = sizeIndex >= GROUP_SIZES.length - 1;
@@ -93,13 +130,23 @@ export function FindBoutScreen({ navigation }: Props) {
     setGroupSize(GROUP_SIZES[next]);
   };
 
-  const find = () =>
+  const find = () => {
+    if (format === 'blitz') {
+      navigation.navigate('BlitzPre', { exerciseType: type });
+      return;
+    }
+    if (format === 'streak') {
+      navigation.navigate('StreakPre', { exerciseType: type });
+      return;
+    }
     navigation.navigate('Searching', {
       exerciseType: type,
       format,
       maxParticipants: players,
       stake,
+      mode,
     });
+  };
 
   return (
     <View style={styles.screen}>
@@ -197,41 +244,68 @@ export function FindBoutScreen({ navigation }: Props) {
           ) : null}
         </View>
 
-        <View>
-          <View style={styles.stakeHead}>
-            <Label size={11}>STAKE</Label>
-            <Label size={11} tracking={0.08}>
-              {`YOU HAVE ${balance === null ? '—' : compactPoints(balance)}`}
-            </Label>
-          </View>
-          <View style={styles.stakeRow}>
-            {STAKE_OPTIONS.map(value => {
-              const on = stake === value;
-              const ok = affordable(value);
-              return (
-                <Pressable
-                  key={value}
-                  disabled={!ok}
-                  onPress={() => setStake(value)}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected: on, disabled: !ok }}
-                  style={[
-                    styles.stakeTile,
-                    on && styles.stakeOn,
-                    !ok && styles.stakeOff,
-                  ]}
-                >
-                  <Numeral size={24} color={on ? colors.onAccent : colors.text}>
-                    {fmtPoints(value)}
-                  </Numeral>
-                  <Text style={[styles.stakeUnit, on && styles.stakeUnitOn]}>
-                    {UNIT}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-        </View>
+        {/*
+          Stake and the ranked switch belong to the search this screen starts.
+          A solo format starts nothing here -- it pushes its own pre-bout
+          screen, which owns both, and shows the calibrated bar alongside
+          them. Showing a second stake picker here would beg the question of
+          which one counted.
+        */}
+        {solo ? null : (
+          <>
+            <View>
+              <View style={styles.stakeHead}>
+                <Label size={11}>STAKE</Label>
+                <Label size={11} tracking={0.08}>
+                  {`YOU HAVE ${balance === null ? '—' : compactPoints(balance)}`}
+                </Label>
+              </View>
+              <View style={styles.stakeRow}>
+                {STAKE_OPTIONS.map(value => {
+                  const on = stake === value;
+                  const ok = affordable(value);
+                  return (
+                    <Pressable
+                      key={value}
+                      disabled={!ok}
+                      onPress={() => setStake(value)}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: on, disabled: !ok }}
+                      style={[
+                        styles.stakeTile,
+                        on && styles.stakeOn,
+                        !ok && styles.stakeOff,
+                      ]}
+                    >
+                      <Numeral size={24} color={on ? colors.onAccent : colors.text}>
+                        {fmtPoints(value)}
+                      </Numeral>
+                      <Text style={[styles.stakeUnit, on && styles.stakeUnitOn]}>
+                        {UNIT}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+
+            <View>
+              <Label size={11} style={styles.fieldLabel}>
+                THIS BOUT
+              </Label>
+              <RankedToggle value={mode} onChange={setMode} />
+              <Text style={styles.helper}>{RANKED_NOTE[mode]}</Text>
+            </View>
+          </>
+        )}
+
+        {solo ? (
+          <Notice icon="crosshair" iconColor={colors.accent}>
+            {format === 'blitz'
+              ? 'Blitz sets three bars to your rank in this exercise. Next screen shows them, and the stake.'
+              : "Streak sets three stages to your rank. Next screen shows all three, and whether the mode's open."}
+          </Notice>
+        ) : null}
 
         {!verifiable ? (
           <Notice icon="clock" iconColor={colors.secondary}>
@@ -259,17 +333,24 @@ export function FindBoutScreen({ navigation }: Props) {
       <Dock style={styles.dock}>
         <View style={styles.summary}>
           <Label size={11} color={colors.secondary} tracking={0.12}>
-            {`${EXERCISE_LABEL[type]} · ${FORMAT_NAME[format].toUpperCase()} · ${players} PLAYERS`}
+            {solo
+              ? `${EXERCISE_LABEL[type]} · ${FORMAT_NAME[format].toUpperCase()} · SOLO`
+              : `${EXERCISE_LABEL[type]} · ${FORMAT_NAME[format].toUpperCase()} · ${players} PLAYERS`}
           </Label>
           <Display size={22} color={colors.accent}>
-            {`POT ${fmtPoints(stake * players)}`}
+            {solo ? 'VS YOUR RANK' : `POT ${fmtPoints(stake * players)}`}
           </Display>
         </View>
         <Text style={styles.dockHelper}>
-          You'll be matched live with fighters at your level. Nothing is staked
-          until the bout is on.
+          {solo
+            ? 'No opponent, no queue. Your targets come from your rank in this exercise, and nothing is staked until the next screen.'
+            : "You'll be matched live with fighters at your level. Nothing is staked until the bout is on."}
         </Text>
-        <Button label="FIND A BOUT" onPress={find} disabled={!canFind} />
+        <Button
+          label={solo ? `SET UP ${FORMAT_NAME[format].toUpperCase()}` : 'FIND A BOUT'}
+          onPress={find}
+          disabled={!canFind}
+        />
       </Dock>
       <TabBar active="find" />
     </View>
@@ -306,15 +387,20 @@ const styles = StyleSheet.create({
   soon: { ...label(9, colors.dim, 0.12) },
   soonOn: { color: colors.onAccentFaint },
 
+  // Five options (four real formats plus the placeholder) no longer fit on
+  // one 375px row, so the control wraps to three per row instead of crushing
+  // "Group Battle" to an ellipsis.
   segment: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     backgroundColor: colors.card,
     borderRadius: radius.control,
     padding: space.xs,
     gap: space.xs,
   },
   segOpt: {
-    flex: 1,
+    flexGrow: 1,
+    flexBasis: '30%',
     height: 40,
     borderRadius: radius.tile,
     alignItems: 'center',
