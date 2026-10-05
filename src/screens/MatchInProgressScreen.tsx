@@ -19,19 +19,18 @@ import {
 import { QUICKPOSE_SDK_KEY } from '@env';
 import { supabase } from '../lib/supabase';
 import { QuickPoseHoldTracker } from '../lib/holdTracker';
-import { formatScore, scoreFor, sortByScore } from '../lib/boutStats';
+import { scoreFor, sortByScore } from '../lib/boutStats';
 import { formatSeconds } from '../lib/format';
 import { initialsOf, peerHandle } from '../lib/identity';
 import { useAuth } from '../context/AuthContext';
 import {
-  STREAK_STAGES,
-  blitzTiersOf,
-  fmtMultiplier,
-  fmtTarget,
-  nextTierFor,
-  tierReachedFor,
-  type BlitzTier,
-} from '../lib/soloModes';
+  FormQualityMeter,
+  blitzMultiplierBp,
+  fmtQuality,
+  fmtScore,
+  scoreFor as scoreOf,
+} from '../lib/score';
+import { STREAK_STAGES, fmtMultiplier } from '../lib/soloModes';
 import type { RootStackParamList } from '../navigation/types';
 import type {
   BlitzRunRow,
@@ -174,14 +173,20 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   const [isRanked, setIsRanked] = useState(false);
   /**
    * Solo context, loaded alongside the challenge. Exactly one of these is set
-   * on a solo match, and both stay null for a 1v1 or a group battle -- which
+   * on a solo match, and both stay null for a 1v1 or a pooled bout -- which
    * is what every `solo` branch below keys off, rather than off the seat count
-   * alone.
+   * alone. Both are in SCORE units.
    */
-  const [blitzTiers, setBlitzTiers] = useState<BlitzTier[] | null>(null);
+  const [blitz, setBlitz] = useState<{
+    threshold: number;
+    benchmark: number;
+    breakevenBp: number;
+    maxBp: number;
+  } | null>(null);
   const [streak, setStreak] = useState<{
     runId: string;
     stage: number;
+    /** Score to beat. */
     target: number;
   } | null>(null);
   const [participants, setParticipants] = useState<MatchParticipantRow[]>([]);
@@ -194,6 +199,12 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   // same-value setState bails out, so this re-renders at most once a second.
   const [heldSeconds, setHeldSeconds] = useState(0);
   const [isHolding, setIsHolding] = useState(false);
+  // Form quality so far, in basis points. Updated when the count or the
+  // held-seconds do, never per frame, so the live score moves with them.
+  const [qualityBp, setQualityBp] = useState(0);
+  // Once submitted: the score the server wrote, so the "in the books" screen
+  // shows what settlement will use rather than a client recomputation.
+  const [recordedScore, setRecordedScore] = useState<number | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [outOfFrame, setOutOfFrame] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -205,6 +216,9 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   // camera frame rate and re-rendering on every frame would tank the UI.
   const counterRef = useRef(new QuickPoseThresholdCounter());
   const holdRef = useRef(new QuickPoseHoldTracker());
+  // Rebuilt for the exercise's mode when the set starts; 'reps' is only the
+  // placeholder before then.
+  const qualityRef = useRef(new FormQualityMeter('reps'));
   const startedAtRef = useRef<number | null>(null);
   const repTimestampsRef = useRef<number[]>([]);
   const fpsSamplesRef = useRef<number[]>([]);
@@ -294,7 +308,13 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
           return;
         }
         if (run) {
-          setBlitzTiers(blitzTiersOf(run as BlitzRunRow));
+          const row = run as BlitzRunRow;
+          setBlitz({
+            threshold: row.threshold_score,
+            benchmark: row.benchmark_score,
+            breakevenBp: row.breakeven_bp,
+            maxBp: row.max_bp,
+          });
         }
       } else if (boutFormat === 'streak') {
         const { data: attempt } = await supabase
@@ -343,9 +363,11 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
         // column being populated means this participant is already done.
         if (mine.rep_count !== null) {
           setRepCount(mine.rep_count);
+          setRecordedScore(mine.score);
           setSubmitted(true);
         } else if (mine.hold_duration_seconds !== null) {
           setHeldSeconds(mine.hold_duration_seconds);
+          setRecordedScore(mine.score);
           setSubmitted(true);
         }
       }
@@ -412,18 +434,34 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
 
       if (config.mode === 'hold') {
         const snapshot = holdRef.current.update(probability, now);
+        // Form quality accrues only over frames the tracker says are in
+        // position: the valid portion, exactly as the held time does.
+        qualityRef.current.observe(probability, snapshot.isHolding);
         const seconds = Math.floor(snapshot.totalHeldMs / 1000);
-        setHeldSeconds(prev => (prev === seconds ? prev : seconds));
+        setHeldSeconds(prev => {
+          if (prev === seconds) {
+            return prev;
+          }
+          // A new second banked: refresh the quality alongside it, so the
+          // live score ticks with the clock rather than every frame.
+          const q = qualityRef.current.snapshot().qualityBp;
+          setQualityBp(old => (old === q ? old : q));
+          return seconds;
+        });
         setIsHolding(prev =>
           prev === snapshot.isHolding ? prev : snapshot.isHolding,
         );
         return;
       }
 
+      qualityRef.current.observe(probability);
       counterRef.current.count(probability, state => {
         if (state.type === 'poseComplete') {
           const elapsedMs = now - (startedAtRef.current ?? now);
           repTimestampsRef.current.push(elapsedMs);
+          // The rep counted: bank its peak, and the score moves with it.
+          qualityRef.current.completeRep();
+          setQualityBp(qualityRef.current.snapshot().qualityBp);
           setRepCount(state.count);
         }
       });
@@ -434,6 +472,8 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   const startSet = () => {
     counterRef.current.reset();
     holdRef.current.reset();
+    qualityRef.current = new FormQualityMeter(config?.mode ?? 'reps');
+    setQualityBp(0);
     startedAtRef.current = Date.now();
     lastInFrameAtRef.current = Date.now();
     repTimestampsRef.current = [];
@@ -542,12 +582,23 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
 
     const anomalyFlag = Object.values(anomalyReasons).some(Boolean);
 
+    // Form quality across the valid portion of the set. The server turns
+    // this and the raw count into the score; the same arithmetic in
+    // score.ts is what the HUD was showing live.
+    const quality = qualityRef.current.snapshot();
+    const form = {
+      qualityBp: quality.qualityBp,
+      samples: quality.samples,
+      repPeaks: config.mode === 'reps' ? [...qualityRef.current.repPeakList()] : undefined,
+    };
+
     // Everything needed to re-review this session by hand later. QuickPose
     // gives no raw landmark stream through the RN bridge, so this is the
     // per-frame signal that is actually available. Same envelope for both
     // modes so the review trail stays uniform.
     const rawMetrics = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      form,
       source: {
         sdk: '@quickpose/react-native',
         feature: config.feature,
@@ -580,6 +631,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
         p_anomaly_flag: anomalyFlag,
         p_hold_duration_seconds:
           config.mode === 'hold' ? finalHoldSeconds : null,
+        p_form_quality_bp: quality.qualityBp,
       },
     );
 
@@ -591,6 +643,10 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
     if (config.mode === 'hold') {
       setHeldSeconds(finalHoldSeconds);
     }
+    setQualityBp(quality.qualityBp);
+    setRecordedScore(
+      scoreOf(config.mode === 'hold' ? finalHoldSeconds : finalRepCount, quality.qualityBp),
+    );
     setSubmitted(true);
   };
 
@@ -598,7 +654,7 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
     if (navigation.canGoBack()) {
       navigation.goBack();
     } else {
-      navigation.navigate('Home');
+      navigation.navigate('Compete');
     }
   };
 
@@ -624,19 +680,23 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   const valueText = isHold ? formatSeconds(heldSeconds) : String(repCount);
   const unit = challengeType ? EXERCISE_SCORE[challengeType] : 'REPS';
   const solo = isSoloFormat(format);
-  // The live score, in whichever unit this exercise scores in. One value, so
-  // the tier/stage maths below does not have to care which mode it is in.
-  const liveScore = isHold ? heldSeconds : repCount;
-  const reachedTier = blitzTiers ? tierReachedFor(liveScore, blitzTiers) : 0;
-  const upcomingTier = blitzTiers ? nextTierFor(liveScore, blitzTiers) : null;
+  // The raw count, and the score it is worth at the form quality so far.
+  // The score is what every bar below is measured in; the count is what the
+  // fighter is actually doing.
+  const liveRaw = isHold ? heldSeconds : repCount;
+  const liveScore = scoreOf(liveRaw, qualityBp);
+  const liveBp = blitz
+    ? blitzMultiplierBp(liveScore, blitz.threshold, blitz.benchmark, blitz.breakevenBp, blitz.maxBp)
+    : 0;
+  const barCleared = blitz !== null && liveScore >= blitz.threshold;
   const stageCleared = streak !== null && liveScore >= streak.target;
 
   if (submitted) {
     // A solo round settles the instant it is submitted (there is nobody to
     // wait for), so the button goes straight to the mode's own result screen
     // rather than to the shared "no decision yet" one. A Streak stage goes to
-    // its RUN, because what happens next -- next stage, buy back in, payout --
-    // is a fact about the run and not about this one match.
+    // its RUN, because what happens next -- next stage, revive, payout -- is
+    // a fact about the run and not about this one match.
     const seeResult = () => {
       if (streak) {
         navigation.replace('StreakRun', { runId: streak.runId });
@@ -649,15 +709,21 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
         <View style={[styles.done, { paddingTop: insets.top + 66 }]}>
           <Label size={11}>IN THE BOOKS</Label>
           <Numeral size={120} color={colors.accent} style={styles.doneValue}>
-            {valueText}
+            {fmtScore(recordedScore ?? liveScore)}
           </Numeral>
           <Label size={12} color={colors.secondary} tracking={0.24}>
-            {unit}
+            SCORE
           </Label>
+          <View style={styles.doneRaw}>
+            <Numeral size={28}>{valueText}</Numeral>
+            <Label size={11} color={colors.secondary} tracking={0.16}>
+              {`${unit} · ${fmtQuality(qualityBp)} FORM`}
+            </Label>
+          </View>
           <Body muted style={styles.doneNote}>
             {solo
-              ? 'Your number is in and the bar is settled. Points move on their own.'
-              : 'The decision lands the moment every result is in. Points move on their own.'}
+              ? 'Your score is in and the bar is settled. Points move on their own.'
+              : 'The decision lands the moment every score is in. Points move on their own.'}
           </Body>
         </View>
         {/* Results handles every state, including "still waiting on the
@@ -720,17 +786,11 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
   const opponents = participants.filter(p => p.user_id !== me);
   // 1v1: the one opponent, by name.
   const opponent = opponents[0] ?? null;
-  const opponentScore =
-    opponent && challengeType ? scoreFor(opponent, challengeType) : null;
+  const opponentScore = opponent ? scoreFor(opponent) : null;
   const opponentHandle = opponent ? peerHandle(opponent.user_id) : null;
-  // Group: the field as a whole. Five avatars don't fit in one glass strip,
+  // Pooled: the field as a whole. Five avatars don't fit in one glass strip,
   // and the only number that matters mid-round is the score to beat.
-  const fieldScores = challengeType
-    ? sortByScore(
-        opponents.map(p => ({ score: scoreFor(p, challengeType) })),
-        challengeType,
-      )
-    : [];
+  const fieldScores = sortByScore(opponents.map(p => ({ score: scoreFor(p) })));
   const inCount = fieldScores.filter(o => o.score !== null).length;
   const bestInField = fieldScores[0]?.score ?? null;
 
@@ -804,38 +864,36 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
               {streak
                 ? stageCleared
                   ? 'stage cleared, keep going'
-                  : 'clear it to advance'
-                : reachedTier > 0
-                  ? `${fmtMultiplier(blitzTiers![reachedTier - 1]!.bp)} banked`
-                  : 'no tier yet'}
+                  : 'score to beat'
+                : barCleared
+                  ? `${fmtMultiplier(liveBp)} banked`
+                  : 'score to break even'}
             </Text>
           </View>
           <View style={styles.stripRight}>
             {streak ? (
               <>
                 <Numeral size={28} color={stageCleared ? colors.accent : colors.text}>
-                  {challengeType ? fmtTarget(streak.target, challengeType) : '—'}
+                  {fmtScore(streak.target)}
                 </Numeral>
                 <Label size={10} tracking={0.12}>
                   TO CLEAR
                 </Label>
               </>
-            ) : upcomingTier ? (
+            ) : barCleared && blitz ? (
               <>
-                <Numeral size={28}>
-                  {challengeType ? fmtTarget(upcomingTier.target, challengeType) : '—'}
+                <Numeral size={28} color={colors.accent}>
+                  {fmtMultiplier(liveBp)}
                 </Numeral>
                 <Label size={10} tracking={0.12}>
-                  {`NEXT · ${fmtMultiplier(upcomingTier.bp)}`}
+                  {liveBp >= blitz.maxBp ? 'MAXED' : `${fmtMultiplier(blitz.maxBp)} AT ${fmtScore(blitz.benchmark)}`}
                 </Label>
               </>
             ) : (
               <>
-                <Numeral size={28} color={colors.accent}>
-                  {blitzTiers ? fmtMultiplier(blitzTiers[2]!.bp) : '—'}
-                </Numeral>
+                <Numeral size={28}>{blitz ? fmtScore(blitz.threshold) : '—'}</Numeral>
                 <Label size={10} tracking={0.12}>
-                  TOP TIER
+                  TO CLEAR
                 </Label>
               </>
             )}
@@ -850,11 +908,9 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
             <Text style={styles.stripHandle}>{`${inCount} of ${seats - 1} in`}</Text>
           </View>
           <View style={styles.stripRight}>
-            <Numeral size={28}>
-              {challengeType ? formatScore(bestInField, challengeType) : '—'}
-            </Numeral>
+            <Numeral size={28}>{fmtScore(bestInField)}</Numeral>
             <Label size={10} tracking={0.12}>
-              {bestInField === null ? 'NOBODY IN YET' : unit}
+              {bestInField === null ? 'NOBODY IN YET' : 'TOP SCORE'}
             </Label>
           </View>
         </View>
@@ -865,11 +921,9 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
             <Text style={styles.stripHandle}>{opponentHandle}</Text>
           </View>
           <View style={styles.stripRight}>
-            <Numeral size={28}>
-              {challengeType ? formatScore(opponentScore, challengeType) : '—'}
-            </Numeral>
+            <Numeral size={28}>{fmtScore(opponentScore)}</Numeral>
             <Label size={10} tracking={0.12}>
-              {opponentScore === null ? 'NOT IN YET' : unit}
+              {opponentScore === null ? 'NOT IN YET' : 'SCORE'}
             </Label>
           </View>
         </View>
@@ -883,41 +937,60 @@ export function MatchInProgressScreen({ route, navigation }: Props) {
           {valueText}
         </Numeral>
         {/*
-          The one thing a solo counter has that a head-to-head one does not:
-          how far the number on screen is from the next thing it is worth. It
-          updates on the same setState the counter does, so it moves with the
-          reps rather than on a timer of its own.
+          The score this count is worth at the form quality so far. It
+          updates on the same setState the counter does, so it moves with
+          the reps rather than on a timer of its own.
         */}
-        {solo && challengeType ? (
+        <View style={styles.scoreLine}>
+          <Label size={11} color={colors.secondary} tracking={0.16}>
+            SCORE
+          </Label>
+          <Numeral size={30} color={colors.accent}>
+            {fmtScore(liveScore)}
+          </Numeral>
+          <Label size={11} color={colors.secondary} tracking={0.16}>
+            {`· ${fmtQuality(qualityBp)} FORM`}
+          </Label>
+        </View>
+        {/*
+          The one thing a solo counter has that a head-to-head one does not:
+          how far the score is from the next thing it is worth.
+        */}
+        {solo ? (
           <View style={styles.progress}>
             {streak ? (
               <Text
                 style={[styles.progressText, stageCleared && styles.progressTextGood]}
               >
                 {stageCleared
-                  ? `STAGE ${streak.stage} CLEARED · ${fmtTarget(streak.target, challengeType)}`
-                  : `STAGE ${streak.stage} AT ${fmtTarget(streak.target, challengeType)}`}
+                  ? `STAGE ${streak.stage} CLEARED · BEAT ${fmtScore(streak.target)}`
+                  : `STAGE ${streak.stage} · BEAT ${fmtScore(streak.target)}`}
               </Text>
-            ) : upcomingTier ? (
-              <Text style={styles.progressText}>
-                {`NEXT TIER AT ${fmtTarget(upcomingTier.target, challengeType)} · ${fmtMultiplier(upcomingTier.bp)}`}
+            ) : blitz ? (
+              <Text style={[styles.progressText, barCleared && styles.progressTextGood]}>
+                {!barCleared
+                  ? `${fmtScore(Math.max(0, blitz.threshold - liveScore))} TO BREAK EVEN`
+                  : liveBp >= blitz.maxBp
+                    ? `MAXED · ${fmtMultiplier(blitz.maxBp)}`
+                    : `${fmtMultiplier(liveBp)} · ${fmtScore(Math.max(0, blitz.benchmark - liveScore))} TO ${fmtMultiplier(blitz.maxBp)}`}
               </Text>
-            ) : (
-              <Text style={[styles.progressText, styles.progressTextGood]}>
-                {blitzTiers
-                  ? `TOP TIER CLEARED · ${fmtMultiplier(blitzTiers[2]!.bp)}`
-                  : ''}
-              </Text>
-            )}
-            {/* Tier pips: filled for every bar already behind you. */}
-            {blitzTiers ? (
-              <View style={styles.pips}>
-                {blitzTiers.map(tier => (
-                  <View
-                    key={tier.tier}
-                    style={[styles.pip, tier.tier <= reachedTier && styles.pipOn]}
-                  />
-                ))}
+            ) : null}
+            {/* The curve as a bar: how far from break-even to the cap. */}
+            {blitz ? (
+              <View style={styles.track}>
+                <View
+                  style={[
+                    styles.trackFill,
+                    {
+                      width: `${Math.round(
+                        Math.max(
+                          0,
+                          Math.min(1, (liveScore - blitz.threshold) / Math.max(1, blitz.benchmark - blitz.threshold)),
+                        ) * 100,
+                      )}%`,
+                    },
+                  ]}
+                />
               </View>
             ) : null}
           </View>
@@ -1090,15 +1163,27 @@ const styles = StyleSheet.create({
   },
   progressText: { ...label(12, colors.secondary, 0.1) },
   progressTextGood: { color: colors.accent },
-  /** Blitz tier pips, per the design's "inactive blitz pips" token. */
-  pips: { flexDirection: 'row', gap: 6 },
-  pip: {
-    width: 22,
+  scoreLine: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: space.sm,
+    marginTop: 4,
+  },
+  /** The break-even-to-cap bar, per the design's "inactive blitz pips" token. */
+  track: {
+    width: 120,
     height: 4,
     borderRadius: 2,
     backgroundColor: colors.handle,
+    overflow: 'hidden',
   },
-  pipOn: { backgroundColor: colors.accent },
+  trackFill: { height: '100%', borderRadius: 2, backgroundColor: colors.accent },
+  doneRaw: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: space.sm,
+    marginTop: space.md,
+  },
 
   form: {
     marginTop: 6,

@@ -479,7 +479,7 @@ export function SearchingScreen({ route, navigation }: Props) {
     if (navigation.canGoBack()) {
       navigation.goBack();
     } else {
-      navigation.navigate('FindBout');
+      navigation.navigate('Compete');
     }
   }, [leaving, navigation]);
 

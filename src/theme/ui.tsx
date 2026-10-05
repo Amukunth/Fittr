@@ -734,6 +734,99 @@ export function RankedBadge({
   );
 }
 
+/**
+ * Pill-style tabs across the top of a screen: a row of rounded pills, the
+ * active one filled in the accent with dark ink, the rest on the card
+ * surface. The reference's tab pattern in Fittr's own colours. Generic over
+ * the key so a screen can type its own set.
+ */
+export function PillTabs<T extends string>({
+  items,
+  value,
+  onChange,
+  style,
+}: Styled<ViewStyle> & {
+  items: ReadonlyArray<{ key: T; label: string; icon?: IconName }>;
+  value: T;
+  onChange: (next: T) => void;
+}) {
+  return (
+    <View style={[styles.pillTabs, style]} accessibilityRole="tablist">
+      {items.map(item => {
+        const on = item.key === value;
+        const ink = on ? colors.onAccent : colors.secondary;
+        return (
+          <Pressable
+            key={item.key}
+            onPress={() => onChange(item.key)}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: on }}
+            style={({ pressed }) => [
+              styles.pillTab,
+              on ? styles.pillTabOn : pressed && styles.pillTabPressed,
+            ]}
+          >
+            {item.icon ? <Icon name={item.icon} size={14} color={ink} /> : null}
+            <Text style={[styles.pillTabText, { color: ink }]}>{item.label}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+/**
+ * The stake control from the reference: minus, the value, plus, in one
+ * raised strip. Steps by position through the offered stakes rather than
+ * by an amount, so the presets stay the single source of truth if they ever
+ * stop being evenly spaced. A stake the balance cannot cover is skipped
+ * over, not offered and then refused.
+ */
+export function StakeStepper({
+  value,
+  options,
+  onChange,
+  balance,
+  unit,
+  style,
+}: Styled<ViewStyle> & {
+  value: number;
+  options: readonly number[];
+  onChange: (next: number) => void;
+  /** null while unknown: every option is offered. */
+  balance: number | null;
+  unit: string;
+}) {
+  const affordable = (n: number) => balance === null || n <= balance;
+  const index = options.indexOf(value);
+  const lower = options.slice(0, Math.max(0, index)).filter(affordable);
+  const higher = options.slice(index + 1).filter(affordable);
+  const prev = lower.length ? lower[lower.length - 1]! : null;
+  const next = higher.length ? higher[0]! : null;
+  return (
+    <View style={[styles.stepper, style]}>
+      <IconCircle
+        icon="minus"
+        bg="transparent"
+        color={prev === null ? colors.dim : colors.text}
+        onPress={prev === null ? undefined : () => onChange(prev)}
+        accessibilityLabel="Lower stake"
+      />
+      <View style={styles.stepperValue}>
+        <Text style={styles.stepperNumber}>{value.toLocaleString('en-US')}</Text>
+        <Text style={styles.stepperUnit}>{unit}</Text>
+      </View>
+      <IconCircle
+        icon="plus"
+        bg="transparent"
+        color={next === null ? colors.dim : colors.text}
+        onPress={next === null ? undefined : () => onChange(next)}
+        accessibilityLabel="Raise stake"
+      />
+    </View>
+  );
+}
+
 /** The spots-claimed bar: one segment per seat. */
 export function Slots({
   filled,
@@ -1043,6 +1136,41 @@ const styles = StyleSheet.create({
     borderRadius: radius.tag,
     alignSelf: 'flex-start',
   },
+
+  pillTabs: {
+    flexDirection: 'row',
+    gap: space.sm,
+  },
+  pillTab: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    height: 40,
+    paddingHorizontal: space.lg + 2,
+    borderRadius: radius.pill,
+    backgroundColor: colors.card,
+  },
+  pillTabOn: { backgroundColor: colors.accent },
+  pillTabPressed: { backgroundColor: colors.raised },
+  pillTabText: {
+    fontFamily: fonts.semibold,
+    fontSize: 13,
+    letterSpacing: 0.4,
+    includeFontPadding: false,
+  },
+  stepper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    height: sizes.button,
+    paddingHorizontal: space.xs,
+    borderRadius: radius.button,
+    backgroundColor: colors.card,
+  },
+  stepperValue: { flexDirection: 'row', alignItems: 'baseline', gap: 5 },
+  stepperNumber: { ...numeral(24) },
+  stepperUnit: { ...labelStyle(10, colors.secondary, 0.1) },
 
   slotOn: { backgroundColor: colors.accent },
   slotOff: { backgroundColor: colors.slot },

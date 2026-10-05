@@ -1,7 +1,8 @@
 import {
   deriveBoutStats,
-  formatScore,
+  formatRaw,
   outcomeOf,
+  rawFor,
   scoreFor,
   sortByScore,
   type BoutRows,
@@ -52,11 +53,19 @@ function match(
   };
 }
 
+/**
+ * A participant row. `rep_count` / `hold_duration_seconds` is the raw
+ * count; `score` is what settlement compares. A caller that gives only the
+ * raw gets a score at 85% form, the way the migration backfilled old rows.
+ */
 function participant(
   matchId: string,
   userId: string,
-  score: Partial<Pick<MatchParticipantRow, 'rep_count' | 'hold_duration_seconds'>> = {},
+  result: Partial<
+    Pick<MatchParticipantRow, 'rep_count' | 'hold_duration_seconds' | 'score' | 'place'>
+  > = {},
 ): MatchParticipantRow {
+  const raw = result.rep_count ?? result.hold_duration_seconds ?? null;
   return {
     id: `${matchId}:${userId}`,
     match_id: matchId,
@@ -64,7 +73,9 @@ function participant(
     rep_count: null,
     hold_duration_seconds: null,
     time_seconds: null,
-    ...score,
+    score: result.score ?? (raw === null ? null : Math.round(raw * 85)),
+    place: result.place ?? null,
+    ...result,
   };
 }
 
@@ -134,6 +145,7 @@ describe('deriveBoutStats', () => {
     expect(stats.wins).toBe(1);
     expect(stats.losses).toBe(1);
     expect(stats.ties).toBe(0);
+    expect(stats.placed).toBe(0);
     expect(stats.winRate).toBe(50);
   });
 
@@ -152,18 +164,21 @@ describe('deriveBoutStats', () => {
     expect(byId.get('m3')).toBe(-50);
   });
 
-  it('pairs each bout with the other participant and their score', () => {
+  it('pairs each bout with the other participant, their score and the raw behind it', () => {
     const m1 = stats.bouts.find(b => b.matchId === 'm1')!;
     expect(m1.opponentId).toBe(MARCUS);
-    expect(m1.myScore).toBe(34);
-    expect(m1.opponentScore).toBe(31);
+    expect(m1.myScore).toBe(34 * 85);
+    expect(m1.myRaw).toBe(34);
+    expect(m1.opponentScore).toBe(31 * 85);
+    expect(m1.opponents[0]!.raw).toBe(31);
     const m3 = stats.bouts.find(b => b.matchId === 'm3')!;
     expect(m3.opponentId).toBe(KT);
     expect(m3.opponentScore).toBeNull();
   });
 
-  it('keeps a personal best per exercise', () => {
+  it('keeps a personal best per exercise in raw units, and a best score', () => {
     expect(stats.bestByType).toEqual({ pushups: 34, plank: 92 });
+    expect(stats.bestScoreByType).toEqual({ pushups: 34 * 85, plank: 92 * 85 });
   });
 
   it('ranks rivals by bouts fought, with the record against each', () => {
@@ -201,14 +216,33 @@ describe('deriveBoutStats', () => {
     expect(tie.bouts[0]!.delta).toBe(0);
     expect(tie.streak).toBe('T');
   });
+
+  it('decides on score, not on the raw count', () => {
+    // Marcus did more reps at worse form; I scored higher.
+    const upset = deriveBoutStats(ME, {
+      ...rows,
+      matches: [match('m1', 'c1', '2026-09-01T10:00:00Z', ME, true)],
+      mine: [participant('m1', ME, { rep_count: 26, score: 2600, place: 1 })],
+      others: [
+        participant('m1', ME, { rep_count: 26, score: 2600, place: 1 }),
+        participant('m1', MARCUS, { rep_count: 30, score: 2550, place: 2 }),
+      ],
+      ledger: [ledger('m1', -100, 'stake'), ledger('m1', 200, 'payout')],
+    });
+    const bout = upset.bouts[0]!;
+    expect(bout.outcome).toBe('win');
+    expect(bout.opponents[0]!.score).toBe(2550);
+    expect(bout.myRaw).toBe(26);
+    expect(upset.bestByType.pushups).toBe(26);
+  });
 });
 
 /**
- * Group Battles. settle_match() leaves winner_id NULL for ANY tie, so with
- * more than two seats winner_id alone cannot tell "shared the pot" from
- * "lost to the fighters who did" — the ledger is what separates them.
+ * Pooled bouts. Since 20260919000000 settlement writes a place and pays
+ * the top three, so the record can tell "shared first", "paid second" and
+ * "lost" apart without reading the ledger.
  */
-describe('deriveBoutStats: group bouts', () => {
+describe('deriveBoutStats: pooled bouts', () => {
   const D = 'dee-0000-0000-0000-0000000000004';
   const groupChallenge = (id: string, seats: number, stake: number): ChallengeRow => ({
     ...challenge(id, 'pushups', 'completed', stake),
@@ -218,38 +252,59 @@ describe('deriveBoutStats: group bouts', () => {
 
   /** Three seats at 100: ME and MARCUS tie on 30, KT trails on 20. */
   const splitPot: BoutRows = {
-    mine: [participant('g1', ME, { rep_count: 30 })],
+    mine: [participant('g1', ME, { rep_count: 30, place: 1 })],
     others: [
-      participant('g1', ME, { rep_count: 30 }),
-      participant('g1', MARCUS, { rep_count: 30 }),
-      participant('g1', KT, { rep_count: 20 }),
+      participant('g1', ME, { rep_count: 30, place: 1 }),
+      participant('g1', MARCUS, { rep_count: 30, place: 1 }),
+      participant('g1', KT, { rep_count: 20, place: 3 }),
     ],
     matches: [match('g1', 'gc1', '2026-09-04T10:00:00Z', null, true)],
     challenges: [groupChallenge('gc1', 3, 100)],
-    ledger: [ledger('g1', -100, 'stake'), ledger('g1', 150, 'payout')],
+    // Tied for first: places 1 and 2 shared, 120 each.
+    ledger: [ledger('g1', -100, 'stake'), ledger('g1', 120, 'payout')],
   };
 
-  it('reads a shared pot as a tie for the fighters who split it', () => {
+  it('reads a shared first place as a tie for the fighters who split it', () => {
     const stats = deriveBoutStats(ME, splitPot);
     const bout = stats.bouts[0]!;
     expect(bout.outcome).toBe('tie');
-    expect(bout.delta).toBe(50);
+    expect(bout.delta).toBe(20);
     expect(bout.seats).toBe(3);
+    expect(bout.myPlace).toBe(1);
     expect(stats.ties).toBe(1);
     expect(stats.wins).toBe(0);
   });
 
-  it('reads the same bout as a loss for the fighter who was paid nothing', () => {
+  it('reads third place with a prize as placed, counted as a loss in the record', () => {
     const asKt = deriveBoutStats(KT, {
       ...splitPot,
-      mine: [participant('g1', KT, { rep_count: 20 })],
-      ledger: [{ ...ledger('g1', -100, 'stake'), user_id: KT }],
+      mine: [participant('g1', KT, { rep_count: 20, place: 3 })],
+      ledger: [
+        { ...ledger('g1', -100, 'stake'), user_id: KT },
+        { ...ledger('g1', 60, 'payout'), user_id: KT },
+      ],
     });
     const bout = asKt.bouts[0]!;
-    expect(bout.outcome).toBe('loss');
-    expect(bout.delta).toBe(-100);
+    expect(bout.outcome).toBe('placed');
+    expect(bout.delta).toBe(-40);
+    expect(bout.myPlace).toBe(3);
+    expect(asKt.placed).toBe(1);
     expect(asKt.losses).toBe(1);
     expect(asKt.ties).toBe(0);
+    expect(asKt.history).toEqual(['L']);
+  });
+
+  it('reads a place with no prize as a loss', () => {
+    const asD = deriveBoutStats(D, {
+      ...splitPot,
+      mine: [participant('g1', D, { rep_count: 5, place: 4 })],
+      others: [...splitPot.others, participant('g1', D, { rep_count: 5, place: 4 })],
+      challenges: [groupChallenge('gc1', 4, 100)],
+      ledger: [{ ...ledger('g1', -100, 'stake'), user_id: D }],
+    });
+    expect(asD.bouts[0]!.outcome).toBe('loss');
+    expect(asD.losses).toBe(1);
+    expect(asD.placed).toBe(0);
   });
 
   it('still calls a sole winner a win when the pot is bigger than the stake', () => {
@@ -257,19 +312,33 @@ describe('deriveBoutStats: group bouts', () => {
       ...splitPot,
       matches: [match('g1', 'gc1', '2026-09-04T10:00:00Z', ME, true)],
       others: [
-        participant('g1', ME, { rep_count: 40 }),
-        participant('g1', MARCUS, { rep_count: 30 }),
-        participant('g1', KT, { rep_count: 20 }),
+        participant('g1', ME, { rep_count: 40, place: 1 }),
+        participant('g1', MARCUS, { rep_count: 30, place: 2 }),
+        participant('g1', KT, { rep_count: 20, place: 3 }),
       ],
-      mine: [participant('g1', ME, { rep_count: 40 })],
-      ledger: [ledger('g1', -100, 'stake'), ledger('g1', 300, 'payout')],
+      mine: [participant('g1', ME, { rep_count: 40, place: 1 })],
+      ledger: [ledger('g1', -100, 'stake'), ledger('g1', 150, 'payout')],
     });
     expect(stats.bouts[0]!.outcome).toBe('win');
-    expect(stats.bouts[0]!.delta).toBe(200);
+    expect(stats.bouts[0]!.delta).toBe(50);
     expect(stats.wins).toBe(1);
   });
 
-  it('orders the field best first and keeps the unscored last', () => {
+  it('falls back to the ledger for rows settled before places existed', () => {
+    const legacy = deriveBoutStats(ME, {
+      ...splitPot,
+      mine: [participant('g1', ME, { rep_count: 30 })],
+      others: [
+        participant('g1', ME, { rep_count: 30 }),
+        participant('g1', MARCUS, { rep_count: 30 }),
+        participant('g1', KT, { rep_count: 20 }),
+      ],
+      ledger: [ledger('g1', -100, 'stake'), ledger('g1', 150, 'payout')],
+    });
+    expect(legacy.bouts[0]!.outcome).toBe('tie');
+  });
+
+  it('orders the field best score first and keeps the unscored last', () => {
     const stats = deriveBoutStats(ME, {
       ...splitPot,
       matches: [match('g1', 'gc1', '2026-09-04T10:00:00Z', null, false)],
@@ -283,15 +352,15 @@ describe('deriveBoutStats: group bouts', () => {
     });
     const bout = stats.bouts[0]!;
     expect(bout.opponents.map(o => o.userId)).toEqual([D, KT, MARCUS]);
-    expect(bout.opponents.map(o => o.score)).toEqual([41, 25, null]);
+    expect(bout.opponents.map(o => o.score)).toEqual([41 * 85, 25 * 85, null]);
     // The 1v1 surfaces read the first opponent, which is now the leader.
     expect(bout.opponentId).toBe(D);
-    expect(bout.opponentScore).toBe(41);
+    expect(bout.opponentScore).toBe(41 * 85);
     expect(bout.outcome).toBe('pending');
     expect(stats.active).toHaveLength(1);
   });
 
-  it('counts every other fighter in a group as a rival', () => {
+  it('counts every other fighter in a pooled bout as a rival', () => {
     const stats = deriveBoutStats(ME, splitPot);
     expect(stats.rivals.map(r => r.userId).sort()).toEqual([KT, MARCUS].sort());
     for (const rival of stats.rivals) {
@@ -301,15 +370,14 @@ describe('deriveBoutStats: group bouts', () => {
 });
 
 describe('sortByScore', () => {
-  it('puts the highest first, except for race where the fastest wins', () => {
+  it('puts the highest score first and the unscored last', () => {
     const field = [{ score: 20 }, { score: null }, { score: 41 }, { score: 25 }];
-    expect(sortByScore(field, 'pushups').map(r => r.score)).toEqual([41, 25, 20, null]);
-    expect(sortByScore(field, 'race').map(r => r.score)).toEqual([20, 25, 41, null]);
+    expect(sortByScore(field).map(r => r.score)).toEqual([41, 25, 20, null]);
   });
 
   it('does not mutate the input', () => {
     const field = [{ score: 1 }, { score: 9 }];
-    sortByScore(field, 'pushups');
+    sortByScore(field);
     expect(field.map(r => r.score)).toEqual([1, 9]);
   });
 });
@@ -325,30 +393,42 @@ describe('outcomeOf', () => {
     expect(outcomeOf({ settled_at: null, winner_id: null }, 'matched', ME, -100, 100)).toBe('pending');
   });
 
-  it('separates a shared pot from a loss by what the ledger paid', () => {
+  it('separates a shared pot from a loss by what the ledger paid, without a place', () => {
     expect(outcomeOf(settled, 'completed', ME, 50, 100)).toBe('tie');
     expect(outcomeOf(settled, 'completed', ME, 0, 100)).toBe('tie');
     expect(outcomeOf(settled, 'completed', ME, -100, 100)).toBe('loss');
+  });
+
+  it('reads the place when settlement wrote one', () => {
+    expect(outcomeOf(settled, 'completed', ME, 20, 100, false, 1)).toBe('tie');
+    expect(outcomeOf(settled, 'completed', ME, -40, 100, false, 3)).toBe('placed');
+    expect(outcomeOf(settled, 'completed', ME, -100, 100, false, 4)).toBe('loss');
+    expect(outcomeOf({ ...settled, winner_id: MARCUS }, 'completed', ME, 80, 100, false, 2)).toBe('placed');
   });
 
   it('names the sole winner from winner_id', () => {
     expect(outcomeOf({ ...settled, winner_id: ME }, 'completed', ME, 200, 100)).toBe('win');
     expect(outcomeOf({ ...settled, winner_id: MARCUS }, 'completed', ME, -100, 100)).toBe('loss');
   });
+
+  it('reads a solo attempt off winner_id alone', () => {
+    expect(outcomeOf({ ...settled, winner_id: ME }, 'completed', ME, 0, 100, true, 1)).toBe('win');
+    expect(outcomeOf(settled, 'completed', ME, 0, 100, true, 1)).toBe('loss');
+  });
 });
 
 describe('scores', () => {
-  it('picks the column settle_match() compares', () => {
-    expect(scoreFor(participant('x', ME, { rep_count: 12 }), 'pushups')).toBe(12);
-    expect(
-      scoreFor(participant('x', ME, { hold_duration_seconds: 75 }), 'wallsit'),
-    ).toBe(75);
-    expect(scoreFor(participant('x', ME), 'plank')).toBeNull();
+  it('reads the score settle_match() compares, and the raw column behind it', () => {
+    const p = participant('x', ME, { rep_count: 12, score: 1140 });
+    expect(scoreFor(p)).toBe(1140);
+    expect(rawFor(p, 'pushups')).toBe(12);
+    expect(rawFor(participant('x', ME, { hold_duration_seconds: 75 }), 'wallsit')).toBe(75);
+    expect(scoreFor(participant('x', ME))).toBeNull();
   });
 
-  it('formats reps as a count and holds as a clock', () => {
-    expect(formatScore(34, 'pushups')).toBe('34');
-    expect(formatScore(92, 'plank')).toBe('1:32');
-    expect(formatScore(null, 'pushups')).toBe('—');
+  it('formats raw reps as a count and holds as a clock', () => {
+    expect(formatRaw(34, 'pushups')).toBe('34');
+    expect(formatRaw(92, 'plank')).toBe('1:32');
+    expect(formatRaw(null, 'pushups')).toBe('—');
   });
 });

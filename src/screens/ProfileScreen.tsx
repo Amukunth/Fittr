@@ -32,6 +32,7 @@ import type { ChallengeType, MySkillRatingRow, StrengthTier } from '../types/dat
 import { TabBar } from '../components/TabBar';
 import {
   EXERCISE_LABEL,
+  FORMAT_NAME,
   RANKED_TYPES,
   TIERS,
   TIER_COLOR,
@@ -238,7 +239,12 @@ export function ProfileScreen({ navigation }: Props) {
                           label="CALL OUT"
                           variant="outline"
                           size="sm"
-                          onPress={() => navigation.navigate('FindBout')}
+                          onPress={() =>
+                            navigation.navigate('ExerciseModes', {
+                              exerciseType: 'pushups',
+                              mode: '1v1',
+                            })
+                          }
                         />
                       </View>
                     );
@@ -269,7 +275,7 @@ export function ProfileScreen({ navigation }: Props) {
               <Button
                 label="TAKE A BOUT"
                 size="md"
-                onPress={() => navigation.navigate('FindBout')}
+                onPress={() => navigation.navigate('Compete')}
                 style={styles.emptyButton}
               />
             </View>
@@ -320,7 +326,7 @@ function barStyle(mark: HistoryMark | null, i: number) {
 
 /**
  * One exercise's standing. Three states, and they are not the same thing:
- * never fought (no rating row at all), placing (a rating exists but is a
+ * never fought (no rating row at all), place (a rating exists but is a
  * seed we have not tested), and placed (a tier we are prepared to assert).
  * The first two both read "Unranked"; the detail line separates them.
  */
@@ -363,11 +369,19 @@ function RecentRow({ bout }: { bout: BoutSummary }) {
         ? 'L'
         : bout.outcome === 'tie'
           ? 'T'
-          : bout.outcome === 'review'
-            ? '?'
-            : '·';
+          : bout.outcome === 'placed'
+            ? String(bout.myPlace ?? '·')
+            : bout.outcome === 'review'
+              ? '?'
+              : '·';
   const won = bout.outcome === 'win';
-  const versus = bout.opponentId ? peerHandle(bout.opponentId) : 'open seat';
+  const versus = bout.solo
+    ? FORMAT_NAME[bout.format]
+    : bout.seats > 2
+      ? `${bout.seats - 1} others`
+      : bout.opponentId
+        ? peerHandle(bout.opponentId)
+        : 'open seat';
   return (
     <View style={styles.recent}>
       <View style={[styles.recentTile, won ? styles.recentTileWin : styles.recentTileOther]}>
@@ -377,7 +391,8 @@ function RecentRow({ bout }: { bout: BoutSummary }) {
       </View>
       <View style={styles.recentText}>
         <Text style={typography.rowTitle}>
-          {EXERCISE_LABEL[bout.type]} <Text style={styles.vs}>vs</Text> {versus}
+          {EXERCISE_LABEL[bout.type]}{' '}
+          {bout.solo ? <Text style={styles.vs}>{versus}</Text> : <><Text style={styles.vs}>vs</Text> {versus}</>}
         </Text>
         <Text style={styles.when}>{relativeDay(bout.createdAt)}</Text>
       </View>

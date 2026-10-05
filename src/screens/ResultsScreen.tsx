@@ -8,6 +8,7 @@ import React, {
 import {
   Animated,
   Easing,
+  ScrollView,
   Share,
   StyleSheet,
   Text,
@@ -16,24 +17,16 @@ import {
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { PayoutCurve } from '../components/PayoutCurve';
 import { channelName, supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
-import {
-  formatScore,
-  outcomeOf,
-  scoreFor,
-  sortByScore,
-} from '../lib/boutStats';
-import { fmtPoints, formatSeconds } from '../lib/format';
+import { outcomeOf, rawFor, scoreFor, sortByScore } from '../lib/boutStats';
+import { fmtPoints } from '../lib/format';
 import { peerHandle } from '../lib/identity';
+import { fmtPlace, prizeFor } from '../lib/pooled';
+import { fmtRaw, fmtScore, formPctOf, rawUnit } from '../lib/score';
 import { ratingResultFor, type RatingResult } from '../lib/skillRating';
-import {
-  blitzRunForMatch,
-  blitzTiersOf,
-  fmtMultiplier,
-  fmtTarget,
-  streakRunIdForMatch,
-} from '../lib/soloModes';
+import { blitzRunForMatch, fmtMultiplier, streakRunIdForMatch } from '../lib/soloModes';
 import type { RootStackParamList } from '../navigation/types';
 import type {
   BlitzRunRow,
@@ -61,7 +54,7 @@ import {
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Results'>;
 
-type Kind = 'win' | 'loss' | 'tie' | 'pending' | 'review';
+type Kind = 'win' | 'loss' | 'tie' | 'placed' | 'pending' | 'review';
 
 export function ResultsScreen({ route, navigation }: Props) {
   const { matchId } = route.params;
@@ -206,13 +199,12 @@ export function ResultsScreen({ route, navigation }: Props) {
 
   const me = session?.user.id ?? null;
   // The ledger net is derived before the outcome because outcomeOf() needs
-  // it: settle_match() leaves winner_id NULL for ANY tie, so once a bout has
-  // more than two seats winner_id alone cannot separate "shared the pot"
-  // from "lost to the fighters who did". A fighter who kept more than -stake
-  // was paid out. RLS scopes the ledger to my rows, so this is my net.
+  // it as the fallback tell for rows without a place. RLS scopes the
+  // ledger to my rows, so this is my net.
   const net = ledgerEntries.reduce((sum, e) => sum + e.amount, 0);
   const stake = challenge?.stake_points ?? 0;
   const solo = challenge ? isSoloFormat(challenge.format) : false;
+  const mine = participants.find(p => p.user_id === me) ?? null;
   const kind: Kind = !match
     ? 'pending'
     : outcomeOf(
@@ -222,14 +214,15 @@ export function ResultsScreen({ route, navigation }: Props) {
         net,
         stake,
         solo,
+        mine?.place ?? null,
       );
 
   /**
    * A Streak stage never renders here. Everything a fighter needs to know
-   * after one -- next stage, buy back in, payout, the five-hour window -- is a
-   * fact about the RUN, and StreakRun owns all three states of it. This screen
-   * is still the destination the Home feed and the camera's fallback use, so
-   * it has to forward rather than refuse.
+   * after one -- next stage, revive, payout, the five-hour window -- is a
+   * fact about the RUN, and StreakRun owns all three states of it. This
+   * screen is still the destination the Compete feed and the camera's
+   * fallback use, so it has to forward rather than refuse.
    *
    * `replace`, so back does not bounce between the two.
    */
@@ -250,12 +243,8 @@ export function ResultsScreen({ route, navigation }: Props) {
 
   // The rating line. Null until settlement has rated the bout; a number
   // only once this exercise is placed -- see showsDelta() for why placement
-  // bouts stay silent.
-  //
-  // A casual bout has no event row at all, by construction: settle_match()
-  // skips _mmr_rate_match() entirely, so nothing was written. That is why the
-  // screen shows NO rating line rather than a "0" -- there is no change to
-  // report, which is different from a change of zero.
+  // bouts stay silent. A casual bout has no event row at all, by
+  // construction, so the screen shows no rating line rather than a "0".
   const rating = ratingResultFor(ratingEvent);
 
   // The win screen lands with a shake, per the design.
@@ -275,7 +264,7 @@ export function ResultsScreen({ route, navigation }: Props) {
     ).start();
   }, [kind, shake]);
 
-  const home = () => navigation.navigate('Home');
+  const home = () => navigation.navigate('Compete');
 
   if (loading) {
     return <Loading />;
@@ -284,10 +273,9 @@ export function ResultsScreen({ route, navigation }: Props) {
   const mode: RankedMode = challenge?.is_ranked ? 'ranked' : 'casual';
 
   // A Blitz result is not a win or a loss against anybody, so it does not
-  // borrow either screen: it shows the ladder with the rung that was reached
-  // marked, the multiplier that rung paid, and the payout. The lime flood is
-  // still reserved for "you took something", which here means tier 1 or
-  // better.
+  // borrow either screen: it shows where the score landed on the curve, the
+  // multiplier that paid, and the payout. The lime flood is still reserved
+  // for "you took something", which here means the bar was cleared.
   if (challenge && challenge.format === 'blitz' && blitzRun?.settled_at) {
     return (
       <BlitzResult
@@ -297,7 +285,7 @@ export function ResultsScreen({ route, navigation }: Props) {
         rating={rating}
         onHome={home}
         onAgain={() =>
-          navigation.replace('BlitzPre', { exerciseType: challenge.type })
+          navigation.replace('ExerciseModes', { exerciseType: challenge.type, mode: 'blitz' })
         }
       />
     );
@@ -309,8 +297,9 @@ export function ResultsScreen({ route, navigation }: Props) {
   // thing about a held pot.
 
   const type = challenge?.type ?? 'pushups';
-  const mine = participants.find(p => p.user_id === me) ?? null;
-  const myScore = mine ? scoreFor(mine, type) : null;
+  const seats = challenge?.max_participants ?? 2;
+  const pooled = challenge?.format === 'pooled';
+  const myScore = mine ? scoreFor(mine) : null;
   // The whole field, best first, unscored last. Every branch below reads
   // from this one ordering so a six-seat card and a 1v1 card agree on who
   // leads, and the top score is the bar's 100%.
@@ -318,9 +307,10 @@ export function ResultsScreen({ route, navigation }: Props) {
     participants.map(p => ({
       userId: p.user_id,
       name: p.user_id === me ? 'you' : peerHandle(p.user_id),
-      score: scoreFor(p, type),
+      score: scoreFor(p),
+      raw: rawFor(p, type),
+      place: p.place ?? null,
     })),
-    type,
   );
   const best = rows[0]?.score ?? null;
   const opponents = rows.filter(r => r.userId !== me);
@@ -329,30 +319,38 @@ export function ResultsScreen({ route, navigation }: Props) {
   // The best opponent: the runner-up when I won, the leader when I lost.
   const leader = opponents[0]?.score ?? null;
   const oppName = opponents[0]?.name ?? 'the other corner';
-  // Margin against the best opponent. Absolute so race, where lower wins,
-  // reads the same way as reps and holds.
-  const margin =
-    myScore !== null && leader !== null
-      ? type === 'pushups'
-        ? String(Math.abs(myScore - leader))
-        : formatSeconds(Math.abs(myScore - leader))
-      : '—';
+  const margin = myScore !== null && leader !== null ? fmtScore(Math.abs(myScore - leader)) : '—';
   const exercise = EXERCISE_LABEL[type].toUpperCase();
-  const scoreRows: ScoreRow[] = rows.map(r => ({
-    id: r.userId,
-    name: r.name,
-    score: formatScore(r.score, type),
-    // Race is a time, so the shortest bar would be the winner's; invert it.
-    pct: type === 'race' ? ratio(best, r.score) : ratio(r.score, best),
-    // Whoever shares the top score is bold. On the win screen that is me by
-    // definition, and only me: a shared top would have settled as a tie.
-    strong: kind === 'win' ? r.userId === me : best !== null && r.score === best,
-  }));
+  const pot = stake * seats;
+  const scoreRows: ScoreRow[] = rows.map((r, i) => {
+    // Placings come from settlement; before it, the order on this card is
+    // provisional, and the number says so by being absent.
+    const place = r.place ?? (match?.settled_at ? i + 1 : null);
+    const pct = formPctOf(r.raw, r.score);
+    return {
+      id: r.userId,
+      name: r.name,
+      score: fmtScore(r.score),
+      sub:
+        r.score === null
+          ? 'not in yet'
+          : `${fmtRaw(r.raw, type)} ${rawUnit(type).toLowerCase()} · ${pct === null ? '—' : `${pct}%`} form`,
+      place: pooled && place !== null ? fmtPlace(place) : null,
+      prize:
+        pooled && place !== null && match?.settled_at
+          ? prizeFor(pot, place)
+          : null,
+      pct: ratio(r.score, best),
+      // Whoever shares the top score is bold. On the win screen that is me by
+      // definition, and only me: a shared top would have settled as a tie.
+      strong: kind === 'win' ? r.userId === me : best !== null && r.score === best,
+    };
+  });
   // The pot is every seat's stake, so a group win pays more than `stake`.
   const winnings = net > 0 ? net : stake;
 
   const share = () => {
-    const tape = `${formatScore(myScore, type)} to ${formatScore(leader, type)}`;
+    const tape = `${fmtScore(myScore)} to ${fmtScore(leader)}`;
     const line =
       kind === 'win'
         ? `Took the pot on Fittr: ${EXERCISE_LABEL[type].toLowerCase()}, ${tape}. +${fmtPoints(winnings)} ${UNIT}.`
@@ -364,27 +362,29 @@ export function ResultsScreen({ route, navigation }: Props) {
   // queue, so there is no way to re-challenge one fighter directly — the
   // next opponent is whoever the queue pairs, the same one if they search too.
   const rematch = () => {
-    // Only ever rendered for a head-to-head bout: Blitz redirects to
-    // BlitzResult and Streak redirects to StreakRun before either loss/tie
-    // branch below can render, so `challenge.format` is always '1v1' or
-    // 'pooled' here -- the cast states that instead of leaving it implicit.
     if (!challenge || isSoloFormat(challenge.format)) {
+      return;
+    }
+    if (challenge.format === 'pooled') {
+      // The next featured competition, not this one again.
+      navigation.replace('Pooled');
       return;
     }
     navigation.replace('Searching', {
       exerciseType: challenge.type,
-      format: challenge.format as Extract<typeof challenge.format, '1v1' | 'pooled'>,
+      format: '1v1',
       maxParticipants: challenge.max_participants,
       stake: challenge.stake_points,
       // A rematch keeps the mode it was played in, rather than resetting to
       // casual: it is a continuation of the same intent, not a fresh visit
-      // to Find a Bout (which is the one place the default has to reset).
+      // to the mode screen (which is the one place the default has to reset).
       mode: challenge.is_ranked ? 'ranked' : 'casual',
     });
   };
 
   const headPad = { paddingTop: insets.top + space.xl };
   const shakeStyle = { transform: [{ translateX: shake }] };
+  const myPlace = mine?.place ?? null;
 
   if (kind === 'win') {
     return (
@@ -408,9 +408,13 @@ export function ResultsScreen({ route, navigation }: Props) {
             onPress={home}
           />
         </View>
-        <Animated.View style={[styles.body, shakeStyle]}>
+        <Animated.ScrollView
+          contentContainerStyle={styles.body}
+          showsVerticalScrollIndicator={false}
+          style={shakeStyle}
+        >
           <Display size={64} tracking={-0.015} color={colors.onAccent}>
-            YOU TOOK{'\n'}THE POT.
+            {pooled ? 'FIRST OF\nTHE FIELD.' : 'YOU TOOK\nTHE POT.'}
           </Display>
           <View style={styles.deltaRow}>
             <Numeral size={120} color={colors.onAccent}>
@@ -423,20 +427,20 @@ export function ResultsScreen({ route, navigation }: Props) {
           <ScoreCard
             onAccent
             rows={scoreRows}
-            caption={`${exercise} · MARGIN ${margin}`}
+            caption={pooled ? `${exercise} · ${seats} SEATS · POT ${fmtPoints(pot)}` : `${exercise} · MARGIN ${margin}`}
           />
           {/* Whether this one counted, on the record of it. */}
           <View style={styles.badgeRow}>
             <RankedBadge mode={mode} onAccent />
           </View>
           {rating ? <RatingLine result={rating} onAccent /> : null}
-        </Animated.View>
+        </Animated.ScrollView>
         <Dock transparent style={styles.dock}>
           <Button label="SHARE THE CARD" variant="onAccentDark" icon="share" onPress={share} />
           <Button
             label="FIND THE NEXT ONE"
             variant="onAccentGhost"
-            onPress={() => navigation.navigate('FindBout')}
+            onPress={() => navigation.navigate('Compete')}
           />
         </Dock>
       </View>
@@ -450,19 +454,30 @@ export function ResultsScreen({ route, navigation }: Props) {
   if (kind === 'loss') {
     head = (
       <Display size={64} tracking={-0.015} color={colors.secondary}>
-        THEY GOT{'\n'}
-        <Text style={styles.white}>YOU.</Text>
+        {pooled ? 'OUT OF\n' : 'THEY GOT\n'}
+        <Text style={styles.white}>{pooled ? 'THE MONEY.' : 'YOU.'}</Text>
       </Display>
     );
-    caption = `${exercise} · SHORT BY ${margin}`;
+    caption = pooled
+      ? `${exercise} · ${myPlace ? `${fmtPlace(myPlace)} OF ${seats}` : 'UNPLACED'}`
+      : `${exercise} · SHORT BY ${margin}`;
+  } else if (kind === 'placed') {
+    head = (
+      <Display size={64} tracking={-0.015}>
+        IN THE{'\n'}
+        <Text style={styles.accentText}>MONEY.</Text>
+      </Display>
+    );
+    detail = `${myPlace ? fmtPlace(myPlace) : 'Placed'} of ${seats}. Not the top score, but a paid seat.`;
+    caption = `${exercise} · ${myPlace ? fmtPlace(myPlace) : 'PLACED'} OF ${seats} · POT ${fmtPoints(pot)}`;
   } else if (kind === 'tie') {
     head = (
       <Display size={64} tracking={-0.015}>
         DEAD{'\n'}HEAT.
       </Display>
     );
-    // A 1v1 tie refunds both stakes; a group tie splits the pot among the
-    // tied fighters, so there is something to show for it.
+    // A 1v1 tie refunds both stakes; a pooled tie splits the places the tied
+    // fighters occupy, so there is something to show for it.
     caption = net > 0 ? `${exercise} · POT SHARED` : `${exercise} · STAKES REFUNDED`;
   } else if (kind === 'review') {
     head = (
@@ -483,10 +498,13 @@ export function ResultsScreen({ route, navigation }: Props) {
       </Display>
     );
     const waiting = opponents.filter(o => o.score === null).length;
+    const seatsOpen = Math.max(0, seats - participants.length);
     if (!match) {
       detail = "The results for this bout aren't in.";
+    } else if (pooled && seatsOpen > 0) {
+      detail = `${seatsOpen} seat${seatsOpen === 1 ? '' : 's'} still to fill. The board is ranked and paid the moment the last score lands. This screen updates itself.`;
     } else if (waiting > 0) {
-      // A 1v1 names the opponent; a group counts them.
+      // A 1v1 names the opponent; a field counts them.
       detail = isGroup
         ? `Waiting on ${waiting} of ${others} to record their round. This screen updates itself.`
         : `Waiting on ${oppName} to record their round. This screen updates itself.`;
@@ -496,21 +514,22 @@ export function ResultsScreen({ route, navigation }: Props) {
     } else {
       detail = 'Every result is in. The decision is landing now.';
     }
-    caption = `${exercise} · ${isGroup ? 'WAITING ON THE FIELD' : 'WAITING ON THE OTHER CORNER'}`;
+    caption = `${exercise} · ${pooled ? 'THE BOARD SO FAR' : isGroup ? 'WAITING ON THE FIELD' : 'WAITING ON THE OTHER CORNER'}`;
     kicker = 'WAITING ON RESULTS';
   }
 
-  // A 1v1 tie nets 0 (stake refunded). A group tie splits the pot among the
-  // tied fighters, so the net is positive; the sign is shown either way.
-  const tieDelta =
+  // A 1v1 tie nets 0 (stake refunded). A pooled tie or a place nets a
+  // share, so the sign is shown either way.
+  const netText =
     net === 0 ? '0' : `${net > 0 ? '+' : '−'}${fmtPoints(Math.abs(net))}`;
   const deltaText =
-    kind === 'tie' ? tieDelta : kind === 'loss' ? `−${fmtPoints(stake)}` : fmtPoints(net);
+    kind === 'tie' || kind === 'placed' ? netText : kind === 'loss' ? `−${fmtPoints(stake)}` : fmtPoints(net);
+  const deltaColor = kind === 'placed' ? colors.accent : colors.dim;
 
   return (
     <View style={styles.screen}>
       <Text style={styles.watermarkLoss} pointerEvents="none">
-        {kind === 'loss' ? 'L' : kind === 'tie' ? 'T' : ''}
+        {kind === 'loss' ? 'L' : kind === 'tie' ? 'T' : kind === 'placed' && myPlace ? String(myPlace) : ''}
       </Text>
       <View style={[styles.head, headPad]}>
         <View style={styles.verified}>
@@ -519,16 +538,16 @@ export function ResultsScreen({ route, navigation }: Props) {
         </View>
         <IconCircle icon="x" color={colors.secondary} accessibilityLabel="Close" onPress={home} />
       </View>
-      <View style={styles.body}>
+      <ScrollView contentContainerStyle={styles.body} showsVerticalScrollIndicator={false}>
         {head}
         {detail ? (
           <Body muted style={styles.detail}>
             {detail}
           </Body>
         ) : null}
-        {kind === 'loss' || kind === 'tie' ? (
+        {kind === 'loss' || kind === 'tie' || kind === 'placed' ? (
           <View style={styles.deltaRow}>
-            <Numeral size={120} color={colors.dim}>
+            <Numeral size={110} color={deltaColor}>
               {deltaText}
             </Numeral>
             <Label size={14} tracking={0.2}>
@@ -543,30 +562,29 @@ export function ResultsScreen({ route, navigation }: Props) {
           </View>
         ) : null}
         {rating ? <RatingLine result={rating} /> : null}
-      </View>
+      </ScrollView>
       <Dock style={styles.dock}>
-        {kind === 'loss' || kind === 'tie' ? (
+        {kind === 'loss' || kind === 'tie' || kind === 'placed' ? (
           <Button
-            label={`REMATCH · ${fmtPoints(stake)} ${UNIT}`}
+            label={pooled ? 'THE NEXT POOL' : `REMATCH · ${fmtPoints(stake)} ${UNIT}`}
             icon="rematch"
             onPress={rematch}
           />
         ) : null}
-        <Button label="BACK TO BOUTS" variant="card" onPress={home} />
+        <Button label="BACK TO COMPETE" variant="card" onPress={home} />
       </Dock>
     </View>
   );
 }
 
 /**
- * A settled Blitz, rendered as what it is: a ladder with a mark on the rung
- * that was reached.
+ * A settled Blitz, rendered as what it is: a score on a curve.
  *
  * Deliberately NOT the 1v1 win or loss screen with different words. There is
  * no opponent, no margin and no tale of the tape; the only comparison that
- * means anything is the one between the score and the three bars, so that is
- * the whole card. Tier 0 keeps the dark screen and says which bar was missed
- * and by how much, because "you needed three more reps" is the one thing
+ * means anything is the one between the score and the two bars, so that is
+ * the whole card. A miss keeps the dark screen and says how far short of
+ * break-even the score fell, because "you needed 120 more" is the one thing
  * worth knowing on the way to trying again.
  */
 function BlitzResult({
@@ -585,71 +603,49 @@ function BlitzResult({
   onAgain: () => void;
 }) {
   const insets = useSafeAreaInsets();
-  const tiers = blitzTiersOf(run);
-  const reached = run.tier_reached ?? 0;
-  const paid = reached > 0;
+  const cleared = run.cleared === true;
   const score = run.score ?? 0;
+  const bp = run.multiplier_bp ?? 0;
   const type = challenge.type;
   const exercise = EXERCISE_LABEL[type].toUpperCase();
-  const missed = tiers[0]!.target - score;
+  const short = Math.max(0, run.threshold_score - score);
+  const net = (run.payout_points ?? 0) - run.stake_points;
   const headPad = { paddingTop: insets.top + space.xl };
 
   const share = () => {
-    const line = paid
-      ? `Blitz on Fittr: ${fmtTarget(score, type)} ${type === 'pushups' ? 'push-ups' : 'hold'} at ${fmtMultiplier(run.multiplier_bp ?? 0)}. +${fmtPoints(run.payout_points ?? 0)} ${UNIT}.`
-      : `Blitz on Fittr: ${fmtTarget(score, type)}. Missed the first bar by ${fmtTarget(missed, type)}.`;
+    const line = cleared
+      ? `Blitz on Fittr: scored ${fmtScore(score)} against a ${fmtScore(run.threshold_score)} bar, ${fmtMultiplier(bp)}. ${net >= 0 ? '+' : '−'}${fmtPoints(Math.abs(net))} ${UNIT}.`
+      : `Blitz on Fittr: scored ${fmtScore(score)}. Missed the bar by ${fmtScore(short)}.`;
     Share.share({ message: line }).catch(() => undefined);
   };
 
-  const ladder = (
-    <View
-      style={[
-        styles.blitzLadder,
-        { backgroundColor: paid ? colors.onAccentWash : colors.card },
-      ]}
-    >
-      {tiers.map(tier => {
-        const cleared = reached >= tier.tier;
-        const isTop = reached === tier.tier;
-        const strong = paid ? colors.onAccent : colors.text;
-        const soft = paid ? colors.onAccentMuted : colors.secondary;
-        const faint = paid ? colors.onAccentFaint : colors.dim;
-        const ink = isTop ? strong : cleared ? soft : faint;
-        return (
-          <View key={tier.tier} style={styles.blitzRow}>
-            <View style={styles.blitzLeft}>
-              <Icon
-                name={cleared ? 'check' : 'x'}
-                size={12}
-                color={cleared ? ink : faint}
-              />
-              <Label size={11} color={ink} tracking={0.1}>
-                {`${fmtTarget(tier.target, type)} ${type === 'pushups' ? 'REPS' : 'HOLD'}`}
-              </Label>
-            </View>
-            <Display size={isTop ? 22 : 18} color={ink}>
-              {fmtMultiplier(tier.bp)}
-            </Display>
-          </View>
-        );
-      })}
-      <Label color={paid ? colors.onAccentFaint : colors.dim}>
-        {`${exercise} · YOU DID ${fmtTarget(score, type)} · STAKED ${fmtPoints(run.stake_points)}`}
+  const summary = (
+    <View style={[styles.blitzCard, { backgroundColor: cleared ? colors.onAccentWash : colors.card }]}>
+      <PayoutCurve
+        threshold={run.threshold_score}
+        benchmark={run.benchmark_score}
+        breakevenBp={run.breakeven_bp}
+        maxBp={run.max_bp}
+        markScore={score}
+        height={240}
+      />
+      <Label color={cleared ? colors.onAccentFaint : colors.dim}>
+        {`${exercise} · SCORED ${fmtScore(score)} · BAR ${fmtScore(run.threshold_score)} · STAKED ${fmtPoints(run.stake_points)}`}
       </Label>
     </View>
   );
 
-  if (paid) {
+  if (cleared) {
     return (
       <View style={styles.flood}>
         <Text style={styles.watermarkWin} pointerEvents="none">
-          {fmtMultiplier(run.multiplier_bp ?? 0)}
+          {fmtMultiplier(bp)}
         </Text>
         <View style={[styles.head, headPad]}>
           <View style={styles.verified}>
             <Icon name="seal-check" size={14} color={colors.onAccent} contrast={colors.accent} />
             <Label size={11} color={colors.onAccentMuted}>
-              {`BLITZ · TIER ${reached} OF 3`}
+              BLITZ · BAR CLEARED
             </Label>
           </View>
           <IconCircle
@@ -660,24 +656,24 @@ function BlitzResult({
             onPress={onHome}
           />
         </View>
-        <View style={styles.body}>
+        <ScrollView contentContainerStyle={styles.body} showsVerticalScrollIndicator={false}>
           <Display size={60} tracking={-0.015} color={colors.onAccent}>
-            {`${fmtMultiplier(run.multiplier_bp ?? 0)}`}{'\n'}CLEARED.
+            {`${fmtMultiplier(bp)}`}{'\n'}{bp >= run.max_bp ? 'MAXED.' : 'PAID.'}
           </Display>
           <View style={styles.deltaRow}>
             <Numeral size={110} color={colors.onAccent}>
-              {`+${fmtPoints(run.payout_points ?? 0)}`}
+              {`${net >= 0 ? '+' : '−'}${fmtPoints(Math.abs(net))}`}
             </Numeral>
             <Label size={14} color={colors.onAccentMuted} tracking={0.2}>
-              {UNIT}
+              {`${UNIT} NET`}
             </Label>
           </View>
-          {ladder}
+          {summary}
           <View style={styles.badgeRow}>
             <RankedBadge mode={mode} onAccent />
           </View>
           {rating ? <RatingLine result={rating} onAccent /> : null}
-        </View>
+        </ScrollView>
         <Dock transparent style={styles.dock}>
           <Button label="SHARE THE CARD" variant="onAccentDark" icon="share" onPress={share} />
           <Button label="GO AGAIN" variant="onAccentGhost" onPress={onAgain} />
@@ -694,17 +690,17 @@ function BlitzResult({
       <View style={[styles.head, headPad]}>
         <View style={styles.verified}>
           <Icon name="seal-check" size={14} color={colors.dim} contrast={colors.bg} />
-          <Label size={11}>BLITZ · NO TIER</Label>
+          <Label size={11}>BLITZ · UNDER THE BAR</Label>
         </View>
         <IconCircle icon="x" color={colors.secondary} accessibilityLabel="Close" onPress={onHome} />
       </View>
-      <View style={styles.body}>
+      <ScrollView contentContainerStyle={styles.body} showsVerticalScrollIndicator={false}>
         <Display size={60} tracking={-0.015} color={colors.secondary}>
           SHORT OF{'\n'}
-          <Text style={styles.white}>THE FIRST.</Text>
+          <Text style={styles.white}>THE BAR.</Text>
         </Display>
         <Body muted style={styles.detail}>
-          {`You needed ${fmtTarget(tiers[0]!.target, type)} for ${fmtMultiplier(tiers[0]!.bp)} and got ${fmtTarget(score, type)}. The bars move with your rank, so they will be here next time.`}
+          {`You needed ${fmtScore(run.threshold_score)} to break even and scored ${fmtScore(score)} — ${fmtScore(short)} short. The bar moves with your rank, so it will be here next time.`}
         </Body>
         <View style={styles.deltaRow}>
           <Numeral size={110} color={colors.dim}>
@@ -714,19 +710,19 @@ function BlitzResult({
             {UNIT}
           </Label>
         </View>
-        {ladder}
+        {summary}
         <View style={styles.badgeRow}>
           <RankedBadge mode={mode} />
         </View>
         {rating ? <RatingLine result={rating} /> : null}
-      </View>
+      </ScrollView>
       <Dock style={styles.dock}>
         <Button
           label={`GO AGAIN · ${fmtPoints(run.stake_points)} ${UNIT}`}
           icon="rematch"
           onPress={onAgain}
         />
-        <Button label="BACK TO BOUTS" variant="card" onPress={onHome} />
+        <Button label="BACK TO COMPETE" variant="card" onPress={onHome} />
       </Dock>
     </View>
   );
@@ -778,7 +774,14 @@ interface ScoreRow {
   /** Participant id. Stub handles are six hex chars and can collide; ids can't. */
   id: string;
   name: string;
+  /** The score, formatted. */
   score: string;
+  /** "34 reps · 88% form", the raw count and the form behind the score. */
+  sub: string;
+  /** "1ST" on a pooled card once settled. */
+  place: string | null;
+  /** What that place paid, once settled. */
+  prize: number | null;
   /** 0..1 share of the bar. */
   pct: number;
   strong: boolean;
@@ -796,14 +799,15 @@ function ScoreCard({
 }) {
   const nameStrong = onAccent ? colors.onAccent : colors.text;
   const nameSoft = onAccent ? colors.onAccentMuted : colors.secondary;
+  const faint = onAccent ? colors.onAccentFaint : colors.dim;
   const track = onAccent ? colors.onAccentGhost : colors.raised;
   const fillStrong = onAccent ? colors.onAccent : colors.text;
   const fillSoft = onAccent ? colors.onAccentFaint : colors.dim;
-  // Up to six rows share the space two used to, on a screen that doesn't
-  // scroll: the number shrinks and the rows pack tighter. The bars keep
-  // their height so the ranking stays legible.
+  // Up to six rows share the space two used to: the number shrinks and the
+  // rows pack tighter. The bars keep their height so the ranking stays
+  // legible.
   const crowded = rows.length > 2;
-  const numeralSize = crowded ? 24 : 30;
+  const numeralSize = crowded ? 22 : 30;
   const cardStyle = {
     backgroundColor: onAccent ? colors.onAccentWash : colors.card,
     gap: crowded ? space.sm : space.md,
@@ -817,6 +821,7 @@ function ScoreCard({
           fontSize: 12,
           color: row.strong ? nameStrong : nameSoft,
         };
+        const subStyle = { ...label(9, faint, 0.08), textTransform: 'none' as const };
         const fillStyle = {
           width: `${Math.round(row.pct * 100)}%` as DimensionValue,
           backgroundColor: row.strong ? fillStrong : fillSoft,
@@ -824,10 +829,25 @@ function ScoreCard({
         return (
           <React.Fragment key={row.id}>
             <View style={styles.scoreRow}>
-              <Text style={nameStyle}>{row.name}</Text>
-              <Numeral size={numeralSize} color={row.strong ? nameStrong : nameSoft}>
-                {row.score}
-              </Numeral>
+              <View style={styles.scoreName}>
+                <View style={styles.scoreNameRow}>
+                  {row.place ? (
+                    <Text style={[label(9, row.strong ? nameStrong : faint, 0.12)]}>{row.place}</Text>
+                  ) : null}
+                  <Text style={nameStyle}>{row.name}</Text>
+                </View>
+                <Text style={subStyle}>{row.sub}</Text>
+              </View>
+              <View style={styles.scoreRight}>
+                <Numeral size={numeralSize} color={row.strong ? nameStrong : nameSoft}>
+                  {row.score}
+                </Numeral>
+                {row.prize !== null ? (
+                  <Text style={label(9, row.prize > 0 ? (onAccent ? nameStrong : colors.accent) : faint, 0.1)}>
+                    {row.prize > 0 ? `+${fmtPoints(row.prize)}` : 'NO PRIZE'}
+                  </Text>
+                ) : null}
+              </View>
             </View>
             <View style={[styles.track, trackStyle]}>
               <View style={[styles.fill, fillStyle]} />
@@ -835,7 +855,7 @@ function ScoreCard({
           </React.Fragment>
         );
       })}
-      <Label color={onAccent ? colors.onAccentFaint : colors.dim}>{caption}</Label>
+      <Label color={faint}>{caption}</Label>
     </View>
   );
 }
@@ -939,9 +959,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.xxl,
   },
   verified: { flexDirection: 'row', alignItems: 'center', gap: space.sm },
-  body: { flex: 1, paddingTop: 26, paddingHorizontal: space.xxl },
+  body: { paddingTop: 26, paddingHorizontal: space.xxl, paddingBottom: space.lg },
   white: { color: colors.text },
   dimText: { color: colors.dim },
+  accentText: { color: colors.accent },
   detail: { marginTop: 14 },
   rating: {
     flexDirection: 'row',
@@ -957,18 +978,12 @@ const styles = StyleSheet.create({
     marginTop: 22,
   },
   badgeRow: { marginTop: space.lg },
-  blitzLadder: {
+  blitzCard: {
     marginTop: space.xxl,
     borderRadius: radius.card,
     padding: space.lg,
     gap: space.md,
   },
-  blitzRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  blitzLeft: { flexDirection: 'row', alignItems: 'center', gap: space.sm + 2 },
 
   scoreCard: {
     marginTop: space.xxl,
@@ -980,9 +995,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    gap: space.md,
   },
+  scoreName: { flex: 1, gap: 2 },
+  scoreNameRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  scoreRight: { alignItems: 'flex-end', gap: 1 },
   track: { height: 8, borderRadius: 4, overflow: 'hidden' },
   fill: { height: '100%', borderRadius: 4 },
   dock: { gap: space.sm + 2 },
-  captionOnAccent: { ...label(10, colors.onAccentFaint) },
 });

@@ -13,6 +13,7 @@
  * on. That is a modelling assumption, not a database fact -- see the EV
  * note at the top of the migration and BACKEND.md.
  */
+import { REFERENCE_QUALITY_BP, scoreFor } from '../src/lib/score';
 import {
   asService,
   asUser,
@@ -55,17 +56,16 @@ interface BlitzRun {
   id: string;
   match_id: string;
   mmr_at_start: number;
-  tier1_target: number;
-  tier2_target: number;
-  tier3_target: number;
-  tier1_rating: number;
-  tier2_rating: number;
-  tier3_rating: number;
-  tier1_bp: number;
-  tier2_bp: number;
-  tier3_bp: number;
+  threshold_raw: number;
+  benchmark_raw: number;
+  threshold_score: number;
+  benchmark_score: number;
+  threshold_rating: number;
+  benchmark_rating: number;
+  breakeven_bp: number;
+  max_bp: number;
   score: number | null;
-  tier_reached: number | null;
+  cleared: boolean | null;
   multiplier_bp: number | null;
   payout_points: number | null;
   stake_points: number;
@@ -78,12 +78,13 @@ interface BlitzPreview {
   mmr: number;
   placement_complete: boolean;
   calibrated_to_me: boolean;
-  tier1_target: number;
-  tier2_target: number;
-  tier3_target: number;
-  tier1_bp: number;
-  tier2_bp: number;
-  tier3_bp: number;
+  threshold_raw: number;
+  benchmark_raw: number;
+  threshold_score: number;
+  benchmark_score: number;
+  breakeven_bp: number;
+  max_bp: number;
+  reference_quality_bp: number;
 }
 
 interface StreakPreview {
@@ -151,20 +152,47 @@ function streakBuyBackIn(user: string, runId: string) {
   return rpcRow<StreakPreview>(db, user, 'SELECT * FROM streak_buy_back_in($1)', [runId]);
 }
 
+/** The fewest reps that score at least `score` at reference form. */
+function repsFor(score: number): number {
+  return Math.ceil((score * 100) / REFERENCE_QUALITY_BP);
+}
+
+/**
+ * Record a round. `reps`/`hold` are raw counts scored at `quality` (full
+ * form unless given); `atScore` / `underScore` are the conveniences the
+ * stage and bar tests use: the fewest reps that reach a SCORE at reference
+ * form, or one rep short of it.
+ */
 async function submit(
   user: string,
   matchId: string,
-  opts: { reps?: number; hold?: number; anomaly?: boolean },
+  opts: {
+    reps?: number;
+    hold?: number;
+    quality?: number;
+    atScore?: number;
+    underScore?: number;
+    anomaly?: boolean;
+  },
 ) {
   const { rows } = await db.pool.query<{ id: string }>(
     'SELECT id FROM match_participants WHERE match_id = $1 AND user_id = $2',
     [matchId, user],
   );
+  let reps = opts.reps ?? null;
+  let quality = opts.quality ?? 10000;
+  if (opts.atScore !== undefined) {
+    reps = repsFor(opts.atScore);
+    quality = REFERENCE_QUALITY_BP;
+  } else if (opts.underScore !== undefined) {
+    reps = repsFor(opts.underScore) - 1;
+    quality = REFERENCE_QUALITY_BP;
+  }
   return rpcAsUser<string>(
     db,
     user,
-    'SELECT submit_verification_session($1, $2, $3::jsonb, $4, $5)',
-    [rows[0]!.id, opts.reps ?? null, JSON.stringify({ test: true }), opts.anomaly ?? false, opts.hold ?? null],
+    'SELECT submit_verification_session($1, $2, $3::jsonb, $4, $5, $6)',
+    [rows[0]!.id, reps, JSON.stringify({ test: true }), opts.anomaly ?? false, opts.hold ?? null, quality],
   );
 }
 
@@ -284,19 +312,19 @@ describe('blitz_preview', () => {
     );
   });
 
-  it('seeds the rating at 1000 on first look, and the ladder is strictly ascending', async () => {
+  it('seeds the rating at 1000 on first look, and the benchmark sits above the threshold', async () => {
     const user = await createUser(db);
     const preview = await blitzPreview(user);
     expect(preview.mmr).toBe(1000);
     expect(preview.placement_complete).toBe(false);
-    expect(preview.tier1_target).toBeLessThan(preview.tier2_target);
-    expect(preview.tier2_target).toBeLessThan(preview.tier3_target);
-    expect([preview.tier1_bp, preview.tier2_bp, preview.tier3_bp]).toEqual([
-      15000, 20000, 25000,
-    ]);
+    expect(preview.threshold_raw).toBeLessThan(preview.benchmark_raw);
+    expect(preview.threshold_score).toBeLessThan(preview.benchmark_score);
+    expect(preview.threshold_score).toBe(scoreFor(preview.threshold_raw, REFERENCE_QUALITY_BP));
+    expect([preview.breakeven_bp, preview.max_bp]).toEqual([10000, 25000]);
+    expect(preview.reference_quality_bp).toBe(REFERENCE_QUALITY_BP);
     // The preview is what settlement rewards later, given via the same
     // ensure-then-read path blitz_start() uses -- so a fighter who previews
-    // then starts is shown the same ladder both times.
+    // then starts is shown the same bars both times.
     expect(await ratingOf(db, user, 'pushups')).toEqual({
       mmr: 1000,
       matches_played: 0,
@@ -304,13 +332,12 @@ describe('blitz_preview', () => {
     });
   });
 
-  it('raises a higher rating to a higher ladder, calibrated equally hard in principle', async () => {
+  it('raises a higher rating to higher bars, calibrated equally hard in principle', async () => {
     const rookie = await createUser(db);
     const veteran = await createRatedUser(db, 'pushups', 1400, { matchesPlayed: 10 });
     const [a, b] = await Promise.all([blitzPreview(rookie), blitzPreview(veteran)]);
-    expect(b.tier1_target).toBeGreaterThan(a.tier1_target);
-    expect(b.tier2_target).toBeGreaterThan(a.tier2_target);
-    expect(b.tier3_target).toBeGreaterThan(a.tier3_target);
+    expect(b.threshold_score).toBeGreaterThan(a.threshold_score);
+    expect(b.benchmark_score).toBeGreaterThan(a.benchmark_score);
   });
 });
 
@@ -353,15 +380,15 @@ describe('blitz_start', () => {
     await expect(blitzStart(user, 'plank', 100)).rejects.toThrow(/round_open/);
   });
 
-  it('snapshots the ladder shown in the preview onto the run', async () => {
+  it('snapshots the bars shown in the preview onto the run', async () => {
     const user = await createUser(db, { points: 500 });
     const preview = await blitzPreview(user);
     const run = await blitzStart(user, 'pushups', 100);
-    expect([run.tier1_target, run.tier2_target, run.tier3_target]).toEqual([
-      preview.tier1_target,
-      preview.tier2_target,
-      preview.tier3_target,
+    expect([run.threshold_score, run.benchmark_score]).toEqual([
+      preview.threshold_score,
+      preview.benchmark_score,
     ]);
+    expect([run.threshold_rating, run.benchmark_rating]).toEqual([1000, 1320]);
   });
 });
 
@@ -372,23 +399,27 @@ describe('a settled Blitz', () => {
     return { user, run };
   }
 
-  it('pays nothing and rates a loss when the first bar is missed', async () => {
-    const { user, run } = await fresh();
-    await submit(user, run.match_id, { reps: run.tier1_target - 1 });
-
+  async function settled(matchId: string) {
     const { rows } = await db.pool.query<{
-      tier_reached: number;
+      score: number;
+      cleared: boolean;
       multiplier_bp: number;
       payout_points: number;
       winner_id: string | null;
     }>(
-      `SELECT br.tier_reached, br.multiplier_bp, br.payout_points, m.winner_id
+      `SELECT br.score, br.cleared, br.multiplier_bp, br.payout_points, m.winner_id
          FROM blitz_runs br JOIN matches m ON m.id = br.match_id
         WHERE br.match_id = $1`,
-      [run.match_id],
+      [matchId],
     );
-    expect(rows[0]).toEqual({
-      tier_reached: 0,
+    return rows[0]!;
+  }
+
+  it('pays nothing and rates a loss when the bar is missed', async () => {
+    const { user, run } = await fresh();
+    await submit(user, run.match_id, { underScore: run.threshold_score });
+    expect(await settled(run.match_id)).toMatchObject({
+      cleared: false,
       multiplier_bp: 0,
       payout_points: 0,
       winner_id: null,
@@ -396,73 +427,61 @@ describe('a settled Blitz', () => {
     expect(await balance(db, user)).toBe(400); // 500 - 100 stake, no payout
     const ev = await eventFor(user, run.match_id);
     expect(ev).not.toBeNull();
-    // Rated as a loss against tier 1's virtual opponent (mmr_at_start).
+    // Rated as a loss against the threshold's virtual opponent (mmr_at_start).
     expect(ev!.mmr_after).toBeLessThan(ev!.mmr_before);
   });
 
-  it('pays tier 1 and rates a win when only the first bar is cleared', async () => {
+  it('breaks even and rates a win when the bar is matched exactly', async () => {
     const { user, run } = await fresh();
-    await submit(user, run.match_id, { reps: run.tier1_target });
-
-    const { rows } = await db.pool.query<{
-      tier_reached: number;
-      multiplier_bp: number;
-      payout_points: number;
-    }>('SELECT tier_reached, multiplier_bp, payout_points FROM blitz_runs WHERE match_id = $1', [
-      run.match_id,
-    ]);
-    expect(rows[0]!.tier_reached).toBe(1);
-    expect(rows[0]!.multiplier_bp).toBe(15000);
-    expect(rows[0]!.payout_points).toBe(Math.floor((100 * 15000) / 10000));
-    expect(await balance(db, user)).toBe(400 + rows[0]!.payout_points);
+    await submit(user, run.match_id, { atScore: run.threshold_score });
+    const result = await settled(run.match_id);
+    expect(result.cleared).toBe(true);
+    expect(result.multiplier_bp).toBe(10000);
+    expect(result.payout_points).toBe(100);
+    expect(result.winner_id).toBe(user);
+    expect(await balance(db, user)).toBe(500);
     const ev = await eventFor(user, run.match_id);
     expect(ev!.mmr_after).toBeGreaterThan(ev!.mmr_before);
   });
 
-  it('pays the TOP tier reached, and rates the same as tier 1 (margin is not weighted)', async () => {
+  it('pays the cap at the benchmark and beyond, and rates the same as breaking even', async () => {
     const { user, run } = await fresh();
-    await submit(user, run.match_id, { reps: run.tier3_target + 5 });
+    await submit(user, run.match_id, { reps: run.benchmark_raw + 5, quality: 10000 });
 
-    const { rows } = await db.pool.query<{ tier_reached: number; multiplier_bp: number }>(
-      'SELECT tier_reached, multiplier_bp FROM blitz_runs WHERE match_id = $1',
-      [run.match_id],
-    );
-    expect(rows[0]!.tier_reached).toBe(3);
-    expect(rows[0]!.multiplier_bp).toBe(25000);
+    const top = await settled(run.match_id);
+    expect(top.cleared).toBe(true);
+    expect(top.multiplier_bp).toBe(25000);
+    expect(top.payout_points).toBe(250);
 
-    // Same rating move as clearing exactly tier 1 by the same margin above
-    // tier 1's own bar would have produced -- i.e. it is rated off
-    // tier1_rating regardless of which tier actually paid.
+    // Same rating move as clearing the bar by nothing: it is rated off
+    // threshold_rating regardless of the margin.
     const second = await fresh();
-    await submit(second.user, second.run.match_id, { reps: second.run.tier1_target });
+    await submit(second.user, second.run.match_id, { atScore: second.run.threshold_score });
     const evTop = await eventFor(user, run.match_id);
-    const evTier1 = await eventFor(second.user, second.run.match_id);
-    // Both start at the same seed and win against the same virtual rating,
-    // so both should move by the same delta.
-    expect(evTop!.delta).toBe(evTier1!.delta);
+    const evEven = await eventFor(second.user, second.run.match_id);
+    expect(evTop!.delta).toBe(evEven!.delta);
   });
 
   it('nets payout minus stake across the match, same shape as a 1v1', async () => {
     const { user, run } = await fresh(1000, 500);
-    await submit(user, run.match_id, { reps: run.tier2_target });
+    await submit(user, run.match_id, { reps: run.benchmark_raw + 5, quality: 10000 });
     // Two ledger rows on this match: the -stake written by blitz_start()
     // (the same shape _mm_try_complete() writes for a queued bout) and the
     // +payout written by _solo_settle(). The net is what Results shows.
     const net = await ledgerNet(user, run.match_id);
-    const payout = Math.floor((100 * 20000) / 10000);
-    expect(net).toBe(payout - 100);
-    expect(await balance(db, user)).toBe(500 - 100 + payout);
+    expect(net).toBe(250 - 100);
+    expect(await balance(db, user)).toBe(500 - 100 + 250);
   });
 
   it('a casual attempt pays exactly the same and rates nothing at all', async () => {
     const user = await createUser(db, { points: 500 });
     const run = await blitzStart(user, 'pushups', 100, false); // casual
-    await submit(user, run.match_id, { reps: run.tier1_target });
+    await submit(user, run.match_id, { atScore: run.threshold_score });
     const { rows } = await db.pool.query<{ payout_points: number }>(
       'SELECT payout_points FROM blitz_runs WHERE match_id = $1',
       [run.match_id],
     );
-    expect(rows[0]!.payout_points).toBe(Math.floor((100 * 15000) / 10000));
+    expect(rows[0]!.payout_points).toBe(100);
     expect(await eventCount(run.match_id)).toBe(0);
     expect(await ratingOf(db, user, 'pushups')).toEqual({
       mmr: 1000,
@@ -473,21 +492,21 @@ describe('a settled Blitz', () => {
 
   it('holds the pot for review on an anomaly flag, and pays nothing until cleared', async () => {
     const { user, run } = await fresh();
-    await submit(user, run.match_id, { reps: run.tier2_target, anomaly: true });
+    await submit(user, run.match_id, { reps: run.benchmark_raw, quality: 10000, anomaly: true });
 
     const { rows: held } = await db.pool.query<{
       status: string;
-      tier_reached: number | null;
+      cleared: boolean | null;
       settled_at: string | null;
     }>(
-      `SELECT c.status, br.tier_reached, m.settled_at
+      `SELECT c.status, br.cleared, m.settled_at
          FROM blitz_runs br
          JOIN matches m ON m.id = br.match_id
          JOIN challenges c ON c.id = m.challenge_id
         WHERE br.match_id = $1`,
       [run.match_id],
     );
-    expect(held[0]).toEqual({ status: 'needs_review', tier_reached: null, settled_at: null });
+    expect(held[0]).toEqual({ status: 'needs_review', cleared: null, settled_at: null });
     expect(await balance(db, user)).toBe(400);
 
     // Clear it, the way a reviewer would (service role), and settle again.
@@ -502,12 +521,10 @@ describe('a settled Blitz', () => {
       await client.query('SELECT settle_match($1)', [run.match_id]);
     });
 
-    const { rows: cleared } = await db.pool.query<{ tier_reached: number; payout_points: number }>(
-      'SELECT tier_reached, payout_points FROM blitz_runs WHERE match_id = $1',
-      [run.match_id],
-    );
-    expect(cleared[0]!.tier_reached).toBe(2);
-    expect(await balance(db, user)).toBe(400 + cleared[0]!.payout_points);
+    const cleared = await settled(run.match_id);
+    expect(cleared.cleared).toBe(true);
+    expect(cleared.multiplier_bp).toBe(25000);
+    expect(await balance(db, user)).toBe(400 + cleared.payout_points);
   });
 });
 
@@ -554,7 +571,7 @@ describe('streak_start', () => {
     // Clear stage 1, so there is no open round in the way, and try again
     // BEFORE opening stage 2's round. This is the gap streak_run_active's
     // own check exists for.
-    await submit(user, started.pending_match_id!, { reps: started.stage1_target });
+    await submit(user, started.pending_match_id!, { atScore: started.stage1_target });
     await expect(streakStart(user, 'pushups', 100)).rejects.toThrow(/streak_run_active/);
   });
 
@@ -589,7 +606,7 @@ describe('a Streak run played to the end', () => {
     const user = await createRatedUser(db, 'pushups', 1000, { matchesPlayed: 10, points: 500 });
     const started = await streakStart(user, 'pushups', 100, true); // ranked
 
-    await submit(user, started.pending_match_id!, { reps: started.stage1_target });
+    await submit(user, started.pending_match_id!, { atScore: started.stage1_target });
     const afterStage1 = await streakPreview(user);
     expect(afterStage1.current_stage).toBe(2);
     expect(afterStage1.state).toBe('active');
@@ -601,12 +618,12 @@ describe('a Streak run played to the end', () => {
     // No second stake for advancing.
     expect(await balance(db, user)).toBe(400);
 
-    await submit(user, opened2.pending_match_id!, { reps: afterStage1.stage2_target });
+    await submit(user, opened2.pending_match_id!, { atScore: afterStage1.stage2_target });
     const afterStage2 = await streakPreview(user);
     expect(afterStage2.current_stage).toBe(3);
 
     const opened3 = await streakNextStage(user, afterStage2.run_id!);
-    await submit(user, opened3.pending_match_id!, { reps: afterStage2.stage3_target });
+    await submit(user, opened3.pending_match_id!, { atScore: afterStage2.stage3_target });
 
     const won = await streakPreview(user);
     expect(won.state).toBe('cooldown');
@@ -630,11 +647,11 @@ describe('a Streak run played to the end', () => {
   it('refuses a new run during the win cooldown, and allows one once it has passed', async () => {
     const user = await createUser(db, { points: 1000 });
     const started = await streakStart(user, 'pushups', 100);
-    await submit(user, started.pending_match_id!, { reps: started.stage1_target });
+    await submit(user, started.pending_match_id!, { atScore: started.stage1_target });
     const s2 = await streakNextStage(user, started.run_id!);
-    await submit(user, s2.pending_match_id!, { reps: s2.stage2_target });
+    await submit(user, s2.pending_match_id!, { atScore: s2.stage2_target });
     const s3 = await streakNextStage(user, s2.run_id!);
-    await submit(user, s3.pending_match_id!, { reps: s3.stage3_target });
+    await submit(user, s3.pending_match_id!, { atScore: s3.stage3_target });
 
     const won = await streakPreview(user);
     expect(won.state).toBe('cooldown');
@@ -654,7 +671,7 @@ describe('a Streak run that fails', () => {
   it('ends the run at the failed stage and opens the buy-back window', async () => {
     const user = await createUser(db, { points: 500 });
     const started = await streakStart(user, 'pushups', 100);
-    await submit(user, started.pending_match_id!, { reps: started.stage1_target - 1 });
+    await submit(user, started.pending_match_id!, { underScore: started.stage1_target });
 
     const failed = await streakPreview(user);
     expect(failed.state).toBe('failed');
@@ -668,10 +685,10 @@ describe('a Streak run that fails', () => {
     const user = await createUser(db, { points: 1000 });
     const started = await streakStart(user, 'pushups', 100);
     // Clear stage 1 first, so there is progress to preserve.
-    await submit(user, started.pending_match_id!, { reps: started.stage1_target });
+    await submit(user, started.pending_match_id!, { atScore: started.stage1_target });
     const s2 = await streakNextStage(user, started.run_id!);
     // Fail stage 2.
-    await submit(user, s2.pending_match_id!, { reps: s2.stage2_target - 1 });
+    await submit(user, s2.pending_match_id!, { underScore: s2.stage2_target });
 
     const failed = await streakPreview(user);
     expect(failed.state).toBe('failed');
@@ -689,7 +706,7 @@ describe('a Streak run that fails', () => {
     expect(boughtBack.pending_match_id).not.toBeNull();
     expect(await balance(db, user)).toBe(1000 - 200);
 
-    await submit(user, boughtBack.pending_match_id!, { reps: boughtBack.stage2_target });
+    await submit(user, boughtBack.pending_match_id!, { atScore: boughtBack.stage2_target });
     const afterBuyback = await streakPreview(user);
     expect(afterBuyback.current_stage).toBe(3);
     expect(afterBuyback.state).toBe('active');
@@ -698,7 +715,7 @@ describe('a Streak run that fails', () => {
   it('refuses a buy-back once the five-hour window has closed, and says so as "expired"', async () => {
     const user = await createUser(db, { points: 500 });
     const started = await streakStart(user, 'pushups', 100);
-    await submit(user, started.pending_match_id!, { reps: started.stage1_target - 1 });
+    await submit(user, started.pending_match_id!, { underScore: started.stage1_target });
     const failed = await streakPreview(user);
 
     await ageStreakFailure(failed.run_id!, 5 * 60 * 60 + 1);
@@ -719,7 +736,7 @@ describe('a Streak run that fails', () => {
   it('re-anchors failed_at when a bought-back attempt fails again', async () => {
     const user = await createUser(db, { points: 1000 });
     const started = await streakStart(user, 'pushups', 100);
-    await submit(user, started.pending_match_id!, { reps: started.stage1_target - 1 });
+    await submit(user, started.pending_match_id!, { underScore: started.stage1_target });
     const firstFailure = await streakPreview(user);
     // Pushed back so the real second failure -- timestamped by the server's
     // own now() a moment later -- cannot land in the same millisecond as
@@ -728,7 +745,7 @@ describe('a Streak run that fails', () => {
     const agedFirstFailure = await streakPreview(user);
 
     const boughtBack = await streakBuyBackIn(user, firstFailure.run_id!);
-    await submit(user, boughtBack.pending_match_id!, { reps: boughtBack.stage1_target - 1 });
+    await submit(user, boughtBack.pending_match_id!, { underScore: boughtBack.stage1_target });
 
     const secondFailure = await streakPreview(user);
     expect(secondFailure.state).toBe('failed');
@@ -842,9 +859,9 @@ describe('grants', () => {
         client.query(
           `INSERT INTO blitz_runs
              (user_id, match_id, exercise_type, stake_points, is_ranked, mmr_at_start,
-              tier1_target, tier2_target, tier3_target,
-              tier1_rating, tier2_rating, tier3_rating, tier1_bp, tier2_bp, tier3_bp)
-           VALUES ($1, gen_random_uuid(), 'pushups', 1, false, 1000, 1,2,3, 1000,1000,1000, 1,1,1)`,
+              threshold_raw, benchmark_raw, threshold_score, benchmark_score,
+              threshold_rating, benchmark_rating, breakeven_bp, max_bp)
+           VALUES ($1, gen_random_uuid(), 'pushups', 1, false, 1000, 1, 2, 85, 170, 1000, 1320, 10000, 25000)`,
           [user],
         ),
       ),

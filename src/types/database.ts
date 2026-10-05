@@ -311,9 +311,18 @@ export interface MatchParticipantRow {
   id: string;
   match_id: string;
   user_id: string;
+  /** The RAW result: reps, or seconds held. Display and personal bests. */
   rep_count: number | null;
   hold_duration_seconds: number | null;
   time_seconds: number | null;
+  /**
+   * round(raw * form_quality_bp / 100): what every contest is decided on
+   * since 20260919000000. A copy of VerificationSessionRow.score, written
+   * in the same statement, readable by the whole field.
+   */
+  score: number | null;
+  /** Finishing position by score, ties sharing the best place (1, 1, 3). NULL until settled. */
+  place: number | null;
 }
 
 export interface VerificationSessionRow {
@@ -322,6 +331,10 @@ export interface VerificationSessionRow {
   raw_metrics: Record<string, unknown>;
   anomaly_flag: boolean;
   reviewed: boolean;
+  /** Mean pose probability across the valid portion of the set, in basis points. */
+  form_quality_bp: number | null;
+  /** round(raw * form_quality_bp / 100). */
+  score: number | null;
   created_at: string;
 }
 
@@ -388,7 +401,7 @@ export interface SkillRatingEventRow {
   delta: number;
   /** 100 during placement, 32 after. */
   k_factor: number;
-  /** Was the rating still placing when this bout STARTED? */
+  /** Was the rating still place when this bout STARTED? */
   was_placement: boolean;
   /** matches_played after this bout. "3 of 5" during placement. */
   matches_played: number;
@@ -408,10 +421,11 @@ export interface SkillRatingEventRow {
 
 /**
  * One Blitz attempt. Readable by its owner; written only by blitz_start()
- * and settlement. Every target, virtual-opponent rating and multiplier is a
- * SNAPSHOT taken when the run started, so the bar shown on the pre-bout
- * screen is the bar settlement judges against even if a bout settling
- * elsewhere moved the rating in between.
+ * and settlement. Both bars, both ratings and both ends of the payout curve
+ * are a SNAPSHOT taken when the run started, so the bar shown on the
+ * pre-bout screen is the bar settlement judges against even if a bout
+ * settling elsewhere moved the rating in between. See src/lib/score.ts for
+ * the curve.
  */
 export interface BlitzRunRow {
   id: string;
@@ -420,24 +434,23 @@ export interface BlitzRunRow {
   exercise_type: ChallengeType;
   stake_points: number;
   is_ranked: boolean;
-  /** The rating the ladder was calibrated from, and tier 1's virtual opponent. */
+  /** The rating the bars were calibrated from, and the threshold's virtual opponent. */
   mmr_at_start: number;
-  /** Strictly ascending. Reps for pushups, seconds for a hold. */
-  tier1_target: number;
-  tier2_target: number;
-  tier3_target: number;
-  /** mmr_at_start + the tier's rating offset. */
-  tier1_rating: number;
-  tier2_rating: number;
-  tier3_rating: number;
-  /** Basis points of the stake: 15000 / 20000 / 25000. */
-  tier1_bp: number;
-  tier2_bp: number;
-  tier3_bp: number;
+  /** The calibrated raw targets behind the two bars (reps, or seconds). Display only. */
+  threshold_raw: number;
+  benchmark_raw: number;
+  /** The bars, in SCORE units. Break-even at the threshold, max_bp at the benchmark. */
+  threshold_score: number;
+  benchmark_score: number;
+  threshold_rating: number;
+  benchmark_rating: number;
+  /** The two ends of the curve, in basis points of the stake: 10000 and 25000. */
+  breakeven_bp: number;
+  max_bp: number;
   /** All four null until settled, all four set after it. */
   score: number | null;
-  /** 0..3. Zero means the first threshold was missed and nothing paid. */
-  tier_reached: number | null;
+  /** score >= threshold_score. False means nothing paid. */
+  cleared: boolean | null;
   multiplier_bp: number | null;
   payout_points: number | null;
   created_at: string;
@@ -462,7 +475,11 @@ export interface StreakPreviewRow {
    * default age band rather than against the fighter's own.
    */
   calibrated_to_me: boolean;
-  /** The run's snapshot while one is live, a fresh calibration otherwise. */
+  /**
+   * The run's snapshot while one is live, a fresh calibration otherwise.
+   * SCORE units since 20260919000000: the calibrated raw target converted at
+   * reference_quality_bp, so "about N reps" is rawAtReference(target).
+   */
   stage1_target: number;
   stage2_target: number;
   stage3_target: number;
@@ -499,24 +516,78 @@ export interface StreakPreviewRow {
    * real remaining time instead of its own idea of it.
    */
   server_now: string;
+  /** The form quality the stage targets were converted at. */
+  reference_quality_bp: number;
 }
 
-/** `blitz_preview()`: the ladder, before anything is staked. */
+/** `blitz_preview()`: the two bars and the curve, before anything is staked. */
 export interface BlitzPreviewRow {
   exercise_type: ChallengeType;
   mmr: number;
   placement_complete: boolean;
   /** See StreakPreviewRow.calibrated_to_me. */
   calibrated_to_me: boolean;
-  tier1_target: number;
-  tier2_target: number;
-  tier3_target: number;
-  tier1_rating: number;
-  tier2_rating: number;
-  tier3_rating: number;
-  tier1_bp: number;
-  tier2_bp: number;
-  tier3_bp: number;
+  /** The calibrated raw targets behind the two bars. Display only. */
+  threshold_raw: number;
+  benchmark_raw: number;
+  /** SCORE units. Break-even at the threshold, the cap at the benchmark. */
+  threshold_score: number;
+  benchmark_score: number;
+  threshold_rating: number;
+  benchmark_rating: number;
+  breakeven_bp: number;
+  max_bp: number;
+  reference_quality_bp: number;
+}
+
+// -- The featured pooled competition -------------------------------------
+
+/**
+ * One row of `pooled_competitions`, readable by any signed-in fighter. The
+ * screens read `pooled_featured()` (below) rather than this table, because
+ * the seat count and the caller's own status are not on the row.
+ */
+export interface PooledCompetitionRow {
+  id: string;
+  exercise_type: ChallengeType;
+  title: string;
+  description: string;
+  entry_fee: number;
+  max_entries: number;
+  challenge_id: string;
+  match_id: string;
+  created_at: string;
+  filled_at: string | null;
+  settled_at: string | null;
+}
+
+/**
+ * `pooled_featured()` / `pooled_enter()`: the competition on the card, with
+ * the seat count and where the caller stands in it. One composite so the
+ * card and the detail screen can never disagree.
+ */
+export interface PooledFeaturedRow {
+  id: string;
+  exercise_type: ChallengeType;
+  title: string;
+  description: string;
+  entry_fee: number;
+  max_entries: number;
+  /** Seats taken so far, including the caller's. */
+  entries: number;
+  /** entry_fee * entries. */
+  pool_points: number;
+  /** entry_fee * max_entries. */
+  max_pool_points: number;
+  match_id: string;
+  entered: boolean;
+  played: boolean;
+  filled_at: string | null;
+  settled_at: string | null;
+  created_at: string;
+  /** 50 / 30 / 20, in basis points of the pot. */
+  prize_shares_bp: number[];
+  server_now: string;
 }
 
 /** One go at one Streak stage, including every buy-back. */

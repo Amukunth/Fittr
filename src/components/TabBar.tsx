@@ -9,7 +9,7 @@ import type { RootStackParamList } from '../navigation/types';
 import { Icon, type IconName } from '../theme/icons';
 import { colors, fonts, label, radius, space } from '../theme/tokens';
 
-export type Tab = 'home' | 'find' | 'rank' | 'profile';
+export type Tab = 'compete' | 'rank' | 'profile';
 
 const TABS: ReadonlyArray<{
   key: Tab;
@@ -17,17 +17,20 @@ const TABS: ReadonlyArray<{
   icon: IconName;
   route: keyof RootStackParamList;
 }> = [
-  { key: 'home', label: 'BOUTS', icon: 'bolt', route: 'Home' },
-  { key: 'find', label: 'FIND', icon: 'crosshair', route: 'FindBout' },
+  { key: 'compete', label: 'COMPETE', icon: 'bolt', route: 'Compete' },
   { key: 'rank', label: 'RANK', icon: 'trophy', route: 'Rank' },
   { key: 'profile', label: 'PROFILE', icon: 'user', route: 'Profile' },
 ];
 
 /**
- * Bouts / Find / Rank / Profile. Rendered by the four top-level screens
- * rather than by a tab navigator: the app is one native stack, and
- * `navigate` to a route already on it pops back rather than pushing, so the
- * stack never grows past those four.
+ * Compete / Rank / Profile. Rendered by the three top-level screens rather
+ * than by a tab navigator: the app is one native stack, and `navigate` to a
+ * route already on it pops back rather than pushing, so the stack never
+ * grows past those three.
+ *
+ * Three tabs, not the old four: Compete absorbed both Bouts (the open
+ * rounds and the way into a bout) and Find (the exercise and mode picker),
+ * and the record lives on Profile.
  */
 export function TabBar({ active }: { active: Tab }) {
   const navigation =
@@ -58,7 +61,7 @@ export function TabBar({ active }: { active: Tab }) {
             }
             onPress={() => {
               if (!selected) {
-                navigation.navigate(tab.route as 'Home');
+                navigation.navigate(tab.route as 'Compete');
               }
             }}
             style={styles.tab}
@@ -105,7 +108,7 @@ const styles = StyleSheet.create({
     borderTopColor: colors.tabLine,
     backgroundColor: colors.bg,
   },
-  // Four tabs share the width evenly. Each is well over the 44px minimum.
+  // Three tabs share the width evenly. Each is well over the 44px minimum.
   tab: {
     flex: 1,
     height: 48,

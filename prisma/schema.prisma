@@ -254,7 +254,7 @@ model SkillRatingEvent {
   delta          Int
   /// 100 during placement, 32 after.
   kFactor        Int           @map("k_factor")
-  /// Whether the rating was still placing when this bout STARTED.
+  /// Whether the rating was still place when this bout STARTED.
   wasPlacement   Boolean       @map("was_placement")
   /// matchesPlayed after this bout.
   matchesPlayed  Int           @map("matches_played")
@@ -429,10 +429,44 @@ model Challenge {
 
   match        Match?
   queueEntries MatchmakingQueueEntry[]
+  /// Set only on the header of a featured pooled competition.
+  pooledCompetition PooledCompetition?
 
   @@index([status])
   @@index([type])
   @@map("challenges")
+}
+
+/// The featured pooled competition: one open at a time, seats filled one
+/// entrant at a time, each entrant playing their round the moment they
+/// enter. Its Challenge (format pooled, maxParticipants = maxEntries,
+/// already `matched`) and Match exist from the moment it opens; entering is
+/// a match_participants row plus the entry fee, and settlement is the same
+/// settle_match() every other bout runs, ranking the field by score and
+/// paying _pool_prize_shares_bp() (50/30/20) to the top three. Casual by
+/// construction: a shared match cannot be half-rated. Written only by
+/// pooled_featured() / pooled_enter() / settle_match(); readable by any
+/// signed-in fighter, because the card is public. See 20260919000000.
+model PooledCompetition {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  exerciseType ChallengeType @map("exercise_type")
+  title        String
+  description  String
+  /// The stake, as Challenge.stakePoints also records it.
+  entryFee     Int           @map("entry_fee")
+  /// Seats, as Challenge.maxParticipants also records it.
+  maxEntries   Int           @map("max_entries")
+  challengeId  String        @unique @map("challenge_id") @db.Uuid
+  challenge    Challenge     @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  matchId      String        @unique @map("match_id") @db.Uuid
+  match        Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// The last seat was taken; the next competition is the featured one.
+  filledAt     DateTime?     @map("filled_at") @db.Timestamptz(6)
+  /// Mirrors Match.settledAt.
+  settledAt    DateTime?     @map("settled_at") @db.Timestamptz(6)
+
+  @@map("pooled_competitions")
 }
 
 enum MatchmakingStatus {
@@ -519,6 +553,8 @@ model Match {
   blitzRun      BlitzRun?
   /// Set only on a one-seat Streak match, one per stage attempt.
   streakAttempt StreakStageAttempt?
+  /// Set only on the match of a featured pooled competition.
+  pooledCompetition PooledCompetition?
 
   @@map("matches")
 }
@@ -529,12 +565,23 @@ model MatchParticipant {
   match   Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
   userId  String @map("user_id") @db.Uuid
 
-  /// Verified result — exactly one of these three is populated, depending
+  /// Verified RAW result — exactly one of these three is populated, depending
   /// on the challenge type (reps for pushups, seconds held for plank/
   /// wallsit, elapsed seconds for race). Not enforced at the DB level in v1.
+  /// Kept for display and for the norms-based placement seed; NOT what a
+  /// contest is decided on since 20260919000000 -- that is `score`.
   repCount        Int? @map("rep_count")
   holdDurationSec Int? @map("hold_duration_seconds")
   timeSeconds     Int? @map("time_seconds")
+  /// round(raw * form_quality_bp / 100): the number every contest is decided
+  /// on. A copy of VerificationSession.score, written in the same statement,
+  /// kept here because verification_sessions is select-own and the whole
+  /// field has to be able to read each other's scores.
+  score           Int?
+  /// Finishing position by score at settlement, ties sharing the best place
+  /// (1, 1, 3). NULL until the bout settles. What pays 50/30/20 in a pooled
+  /// bout, and what the Results screen reads a "2nd of 6" from.
+  place         Int?
 
   verificationSession VerificationSession?
 
@@ -552,23 +599,32 @@ model VerificationSession {
   rawMetrics         Json             @map("raw_metrics")
   anomalyFlag        Boolean          @default(false) @map("anomaly_flag")
   reviewed           Boolean          @default(false)
+  /// Mean pose probability across the VALID portion of the session (frames
+  /// inside a counted rep or a held segment), in basis points: 10000 means
+  /// every valid rep hit probability 1.0. Client-reported, like the raw
+  /// count. NULL on a submission that carried no reading, which is scored
+  /// at _score_reference_quality_bp() instead.
+  formQualityBp      Int?             @map("form_quality_bp")
+  /// round(raw * form_quality_bp / 100). Computed by
+  /// submit_verification_session(), mirrored onto MatchParticipant.score.
+  score              Int?
   createdAt          DateTime         @default(now()) @map("created_at")
 
   @@map("verification_sessions")
 }
 
-/// One Blitz attempt: a solo set against three ascending thresholds, each
-/// calibrated to the fighter's MMR for that exercise at the moment the run
-/// started. Written only by blitz_start() and _solo_settle(), both SECURITY
-/// DEFINER; readable by its owner and by nobody else, with no client INSERT
-/// or UPDATE grant at all -- a client that could write its own thresholds
-/// could set them to one rep.
+/// One Blitz attempt: a solo set against ONE score threshold calibrated to
+/// the fighter's MMR for that exercise, paying on a curve from break-even at
+/// the threshold to 2.5x at a higher benchmark score. Written only by
+/// blitz_start() and _solo_settle(), both SECURITY DEFINER; readable by its
+/// owner and by nobody else, with no client INSERT or UPDATE grant at all --
+/// a client that could write its own threshold could set it to one rep.
 ///
-/// Every target, virtual-opponent rating and multiplier is SNAPSHOTTED here
+/// Both bars, both ratings and both ends of the curve are SNAPSHOTTED here
 /// at start. Settlement reads the snapshot and never recalibrates, for the
 /// same reason MatchmakingQueueEntry snapshots its mmr: a bout settling
 /// elsewhere can move the rating mid-run, and the bar has to be the one the
-/// fighter was shown.
+/// fighter was shown. See 20260919000000 for the curve.
 model BlitzRun {
   id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId       String        @map("user_id") @db.Uuid
@@ -580,32 +636,33 @@ model BlitzRun {
   exerciseType ChallengeType @map("exercise_type")
   stakePoints  Int           @map("stake_points")
   isRanked     Boolean       @map("is_ranked")
-  /// The rating the whole ladder was calibrated from, and the rating tier
-  /// 1's virtual opponent is.
+  /// The rating the bars were calibrated from, and the rating the
+  /// threshold's virtual opponent is.
   mmrAtStart   Int           @map("mmr_at_start")
 
-  /// Strictly ascending (CHECK). Reps for pushups, seconds for a hold.
-  tier1Target  Int           @map("tier1_target")
-  tier2Target  Int           @map("tier2_target")
-  tier3Target  Int           @map("tier3_target")
-  /// mmrAtStart + _solo_blitz_tier_offsets()[i]: the implied rating of each
-  /// threshold, stored so a later change to the offsets cannot re-rate a run
-  /// that is already in flight.
-  tier1Rating  Int           @map("tier1_rating")
-  tier2Rating  Int           @map("tier2_rating")
-  tier3Rating  Int           @map("tier3_rating")
-  /// Basis points of the stake: 15000 / 20000 / 25000 = 1.5x / 2x / 2.5x.
-  /// Integer basis points rather than a numeric multiplier so a payout is
-  /// integer arithmetic end to end.
-  tier1Bp      Int           @map("tier1_bp")
-  tier2Bp      Int           @map("tier2_bp")
-  tier3Bp      Int           @map("tier3_bp")
+  /// The calibrated raw targets (reps, or seconds) behind the two bars, for
+  /// the "about 30 reps at reference form" caption. Not compared against.
+  thresholdRaw    Int        @map("threshold_raw")
+  benchmarkRaw    Int        @map("benchmark_raw")
+  /// The bars, in score units. Break-even at the threshold; the multiplier
+  /// reaches maxBp at the benchmark (strictly above it -- CHECK).
+  thresholdScore  Int        @map("threshold_score")
+  benchmarkScore  Int        @map("benchmark_score")
+  /// mmrAtStart, and mmrAtStart + _solo_blitz_benchmark_offset(): stored so
+  /// a later change to the offset cannot re-rate a run already in flight.
+  thresholdRating Int        @map("threshold_rating")
+  benchmarkRating Int        @map("benchmark_rating")
+  /// The two ends of the curve, in basis points of the stake: 10000 (1.0x)
+  /// and 25000 (2.5x). Integer basis points so a payout is integer
+  /// arithmetic end to end.
+  breakevenBp     Int        @map("breakeven_bp")
+  maxBp           Int        @map("max_bp")
 
   /// All four NULL until settlement, all four populated after it (CHECK).
   score        Int?
-  /// 0..3. Zero means the first threshold was missed: the stake is gone and
-  /// there is no payout ledger row at all.
-  tierReached  Int?          @map("tier_reached")
+  /// score >= thresholdScore. False means the stake is gone and there is no
+  /// payout ledger row at all.
+  cleared      Boolean?
   multiplierBp Int?          @map("multiplier_bp")
   payoutPoints Int?          @map("payout_points")
 
@@ -641,7 +698,9 @@ model StreakRun {
   isRanked     Boolean         @map("is_ranked")
   mmrAtStart   Int             @map("mmr_at_start")
 
-  /// Strictly ascending (CHECK), snapshotted at start.
+  /// Strictly ascending (CHECK), snapshotted at start. SCORE units since
+  /// 20260919000000: the calibrated raw target converted at the reference
+  /// form quality, exactly as a Blitz bar is.
   stage1Target Int             @map("stage1_target")
   stage2Target Int             @map("stage2_target")
   stage3Target Int             @map("stage3_target")
@@ -703,6 +762,7 @@ model StreakStageAttempt {
   /// stages 2 and 3.
   isBuyBack  Boolean   @default(false) @map("is_buy_back")
 
+  /// SCORE units since 20260919000000.
   score      Int?
   passed     Boolean?
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)

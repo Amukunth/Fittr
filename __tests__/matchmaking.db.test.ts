@@ -622,7 +622,7 @@ describe('settle_match for N seats', () => {
     expect(await balance(db, tie.b)).toBe(500);
   });
 
-  it('pays the whole pot to a sole group winner', async () => {
+  it('pays a group pot 50 / 30 / 20 by place (since 20260919000000)', async () => {
     const { members, matchId } = await group(3, 100);
     const [a, b, c] = members;
     await submit(a!, matchId, { reps: 10 });
@@ -631,9 +631,16 @@ describe('settle_match for N seats', () => {
     await submit(c!, matchId, { reps: 20 });
     const { rows } = await db.pool.query('SELECT winner_id FROM matches WHERE id = $1', [matchId]);
     expect(rows[0].winner_id).toBe(b);
-    expect(await balance(db, a!)).toBe(400);
-    expect(await balance(db, b!)).toBe(700);
-    expect(await balance(db, c!)).toBe(400);
+    // Pot 300: first 150, second 90, third 60. Everyone staked 100.
+    expect(await balance(db, b!)).toBe(550);
+    expect(await balance(db, c!)).toBe(490);
+    expect(await balance(db, a!)).toBe(460);
+    const places = await db.pool.query<{ user_id: string; place: number }>(
+      'SELECT user_id, place FROM match_participants WHERE match_id = $1',
+      [matchId],
+    );
+    const byUser = new Map(places.rows.map(r => [r.user_id, r.place]));
+    expect([byUser.get(b!), byUser.get(c!), byUser.get(a!)]).toEqual([1, 2, 3]);
     expect(await challengeStatus((await db.pool.query('SELECT challenge_id FROM matches WHERE id = $1', [matchId])).rows[0].challenge_id)).toBe('completed');
   });
 
@@ -648,15 +655,22 @@ describe('settle_match for N seats', () => {
     const { rows } = await db.pool.query('SELECT winner_id, settled_at FROM matches WHERE id = $1', [matchId]);
     expect(rows[0].winner_id).toBeNull();
     expect(rows[0].settled_at).not.toBeNull();
-    expect(await balance(db, a!)).toBe(550);
-    expect(await balance(db, b!)).toBe(550);
-    expect(await balance(db, c!)).toBe(400);
-    expect(await ledgerFor(c!, matchId)).toEqual([{ amount: -100, reason: 'stake' }]);
+    // Pot 300. The two tied for first occupy places 1 and 2 and share
+    // 50% + 30% = 240 between them; third place takes its 20%.
+    expect(await balance(db, a!)).toBe(520);
+    expect(await balance(db, b!)).toBe(520);
+    expect(await balance(db, c!)).toBe(460);
+    expect(await ledgerFor(c!, matchId)).toEqual([
+      { amount: -100, reason: 'stake' },
+      { amount: 60, reason: 'payout' },
+    ]);
   });
 
   it('returns tie_split versus tie_refunded from a direct call and conserves an uneven pot', async () => {
-    // Four seats at 50: pot 200. Three tie -> 66 each, the 2 left over go
-    // to the lowest user_id among the tied, in their single payout row.
+    // Four seats at 50: pot 200. Three tie for first, so they occupy places
+    // 1-3 and share the whole prize table (100 + 60 + 40 = 200) three ways:
+    // 66 each, the 2 left over to the lowest user_id among them, in their
+    // single payout row. Fourth place gets nothing.
     const { members, matchId } = await group(4, 50);
     const sorted = [...members].sort();
     const loser = sorted[3]!;
@@ -714,7 +728,8 @@ describe('settle_match for N seats', () => {
       [matchId, a!],
     );
     expect(await settle(b!, matchId)).toBe('settled');
-    expect(await balance(db, a!)).toBe(700);
+    // First place takes 50% of the 300 pot.
+    expect(await balance(db, a!)).toBe(550);
   });
 
   it('is open to participants and the service role only', async () => {

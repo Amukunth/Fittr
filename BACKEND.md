@@ -535,6 +535,19 @@ machine before the CLI's engine binaries will be present.
   analogue of the SDK's rep counter. Unit-tested in
   `__tests__/holdTracker.test.ts`; it takes an injected clock precisely so it
   can be verified without a device.
+- `prisma/migrations/20260919000000_score_based_settlement/migration.sql` —
+  the score columns, `submit_verification_session()` with form quality,
+  score-based `settle_match()` / `_mmr_rate_match()` / `_solo_settle()`, the
+  Blitz curve, `pooled_competitions` and its two RPCs. See "Score-based
+  settlement" at the end of this file.
+- `src/lib/score.ts` — the score arithmetic, the Blitz curve and the
+  `FormQualityMeter`, all mirroring the SQL tunables.
+- `src/lib/pooled.ts` — the client half of the featured pooled competition.
+- `src/screens/CompeteScreen.tsx`, `src/screens/ExerciseModesScreen.tsx`,
+  `src/screens/modes/*`, `src/screens/PooledScreen.tsx` — the Compete tab
+  and what it leads to. `src/components/PayoutCurve.tsx` and
+  `src/components/StreakStages.tsx` are the two pieces of the reference
+  layouts built as components.
 
 ## Settings: profile identity, preferences, devices, deletion (2026-09-07)
 
@@ -2085,6 +2098,14 @@ things that could drift from it otherwise.
 
 ### Blitz: the multiplier/MMR calibration
 
+> **Superseded by `20260919000000` (see "Score-based settlement, the Blitz
+> curve, the pooled competition, and the Compete screen" at the end of this
+> file).** The three tiers became one threshold and a payout curve, and every
+> target is now a score rather than a rep count. The calibration below --
+> rating offsets converted through the norms table -- is still exactly how
+> the threshold and the benchmark are placed, which is why it is worth
+> reading; the tier table, the multipliers and the EV arithmetic are history.
+
 The three tiers are **rating offsets**, not multiples of a base score:
 
 ```
@@ -2375,6 +2396,12 @@ again afterward.
 
 ### Screens
 
+> **Superseded by `20260919000000`.** `FindBoutScreen`, `BlitzPreScreen`
+> and `StreakPreScreen` no longer exist; their jobs moved to the Compete
+> screen and the per-exercise mode screen (see the end of this file).
+> `StreakRunScreen`, `MatchInProgressScreen` and `ResultsScreen` survive
+> with the changes noted there.
+
 Two new pre-bout screens and one new "what happened" screen, all reached
 from `FindBoutScreen`'s format picker (now five options: `1v1`, `pooled`,
 `blitz`, `streak`, and the still-unbuilt `Bracket` placeholder):
@@ -2540,3 +2567,440 @@ here rather than silently left for someone to wonder about later.
 every check above is schema/grant introspection, not a fighter clearing a
 bar. See "What is NOT verified" above, which stands unchanged by a
 successful deploy.
+
+## Score-based settlement, the Blitz curve, the pooled competition, and the Compete screen (2026-09-19)
+
+Migration `20260919000000_score_based_settlement`. One migration, four
+things that share one idea: a contest is decided on a **score**, not on a
+raw count, and every mode reads that score off the same column.
+
+```
+verification_sessions.form_quality_bp   mean pose probability across the VALID portion, bp
+verification_sessions.score             round(valid_raw * form_quality_bp / 100)
+match_participants.score                the readable copy of the above
+match_participants.place              finishing position at settlement (1,1,3 on a tie)
+_score_for() / _score_at_reference()    the arithmetic, mirrored in src/lib/score.ts
+blitz_runs.threshold_* / benchmark_*    one bar and a curve, replacing the three tiers
+pooled_competitions                     the featured pooled competition
+pooled_featured() / pooled_enter()      its two RPCs
+settle_match()                          head-to-head on score; pooled paid 50/30/20
+```
+
+### The score
+
+```
+score = round(valid_raw * form_quality_bp / 100)
+```
+
+- **valid_raw** is the rep count or hold seconds that already cleared the
+  existing validity bar — the 0.6 / 0.3 hysteresis in the SDK's
+  `QuickPoseThresholdCounter` and in `src/lib/holdTracker.ts`. A half-rep
+  or a jittery hold segment is not in it, exactly as before. Nothing about
+  what counts as a rep changed.
+- **form_quality_bp** is the mean pose probability across that valid
+  portion, in basis points (10000 = every valid rep hit probability 1.0).
+  Reps: the *peak* probability inside each counted rep, averaged over the
+  counted reps; a rep in progress when the set ends is not in it. Holds:
+  the mean probability over the frames the hold tracker says are in
+  position; frames outside a segment are not in it. Implemented as
+  `FormQualityMeter` in `src/lib/score.ts`, fed per frame from
+  `MatchInProgressScreen` beside the counter and the tracker it mirrors,
+  and unit-tested without a camera in `__tests__/score.test.ts`.
+
+So 30 reps at 85% form score 2550, and 26 reps at 100% form score 2600 and
+beat them. The raw number is kept everywhere it was: `rep_count` /
+`hold_duration_seconds` still hold the count, `raw_metrics` (now
+`schemaVersion: 2`, with a `form` block carrying the quality, the sample
+count and the per-rep peaks) still holds the telemetry, the norms-based
+placement seed still reads the raw count because `performance_norms` is in
+reps and seconds, and the Results tape still prints "34 reps · 88% form"
+under each score. What changed is the column every comparison reads.
+
+**Who computes what.** The client is the only place per-frame
+probabilities exist, so it reports `p_form_quality_bp` alongside the raw
+count — `submit_verification_session()` gained that sixth argument, the
+old five-argument signature is dropped (the same no-two-overloads rule as
+every signature change since `20260903300000`), and `NULL` is accepted.
+The **server** turns the two into the score and writes it in two places:
+`verification_sessions` (the record, select-own, next to `raw_metrics`)
+and `match_participants` (the read model, because participants can read
+each other's rows and the tale of the tape needs the whole field). Same
+value, same statement, never updated afterwards.
+
+**A submission with no quality reading is scored at the reference
+quality**, `_score_reference_quality_bp()` = 8500, never at 100%. That is
+what an older client, and every pre-existing test helper, gets: "the
+expected form", not "perfect form". The four database suites that predate
+this (`matchmaking`, `skillRating`, `performanceNorms`, `rank`) still call
+the five-argument shape and still pass, because they only ever compare who
+did *more*, and at one flat quality the order is unchanged.
+
+**The trust boundary is unchanged.** The rep count was self-reported from
+the device; form quality is too. This makes a score no more verifiable
+than a count was — see "Camera verification — what it does and doesn't
+prove" at the top of this file, which still applies word for word.
+
+**Backfill.** Every recorded result on the live project gets
+`score = _score_at_reference(raw)` and a `place` derived from that score
+for bouts already settled. Nothing is re-settled: `settled_at`,
+`winner_id` and every ledger row are exactly as they were. Because every
+historical bout on this project was decided on raw counts at what is now a
+flat reference quality, the backfilled places reproduce the recorded
+outcomes.
+
+### Thresholds: calibrated in raw units, converted at a reference form quality
+
+`performance_norms` is in reps and seconds, so a rating still maps to a raw
+target through `_solo_target_for_rating()` exactly as `20260916000100`
+built it. The target is then converted to a score:
+
+```
+threshold_score = round(raw_target * 8500 / 100)
+```
+
+It says: a fighter at this rating is expected to clear the calibrated rep
+count at 85% form. Cleaner form clears the bar with fewer reps; sloppier
+form needs more.
+
+⚠️ **85% is a placeholder until real sessions say otherwise, and it is the
+single number in this migration most worth revisiting.** Nobody has yet
+measured what QuickPose's `fitness.*` probability averages over an honest
+set on a real phone. If real form clusters at 92%, every Blitz and Streak
+bar is ~8% easier than its rating implies; at 78%, ~8% harder. It is one
+tunable function so it can be moved the moment there is data, and every
+preview row carries `reference_quality_bp` so the screens can print
+"≈ 30 reps at 85% form" next to a score rather than asking a fighter to
+picture 2,550. **When it moves, re-check the EV note below.**
+
+`streak_runs.stage{1,2,3}_target` and `streak_stage_attempts.score` keep
+their names and change their **unit** to score (column comments say so; the
+one live row of each on the test project was converted). `_streak_view()`
+and `streak_start()` calibrate in raw units, nudge adjacent stages apart in
+raw units as before, and convert each one — `_score_at_reference()` is
+strictly increasing (each rep is worth 85 points), so a ladder that was
+ascending in reps is ascending in score.
+
+### 1v1: the higher score takes both stakes
+
+`settle_match()`'s head-to-head branch reads `mp.score` for `v_best` and
+`v_winners`. The whole-pot rule, the tie refund, the anomaly gate, the lock
+order and the return values are unchanged. `_mmr_rate_match()` decides
+`S_ij` on score too, so the rating can never disagree with the money about
+who beat whom (`score.db.test.ts` pins this with a bout where the loser
+did more reps); its first-bout norms seed still reads the raw count.
+
+Every settled head-to-head bout now also writes `place` for every seat
+(`rank() OVER (ORDER BY score DESC)`, so a tie for first is 1, 1, 3), which
+is what lets the client tell "shared first" from "paid second" from "lost"
+without reading the ledger — see `outcomeOf()` in `src/lib/boutStats.ts`,
+which falls back to the old ledger tell when a row has no place.
+
+### Pooled: one featured competition, play on entry, top three paid
+
+The queue-based Group Battle (3–6 seats, 20-second heartbeats,
+`enter_matchmaking(..., 'pooled', ...)`) is **left in place server-side**
+— its settlement simply follows the new pooled rule below — but it is no
+longer reachable from the app. What "pooled" means on the Compete screen
+is the featured competition:
+
+- **One open `pooled_competitions` row at a time.** `pooled_featured()`
+  returns the oldest one with a seat left, opening the next one on demand
+  (rotating push-ups → plank → wall-sit by count, so each exercise gets its
+  turn however fast any one fills) under a `pooled:featured` advisory lock
+  so two fighters looking at an empty card open one competition, not two.
+- **Its Challenge and Match exist from the moment it opens**, with
+  `format = 'pooled'`, `status = 'matched'`, `max_participants =
+  _pool_max_entries()` (6) and `stake_points = _pool_entry_fee()` (100,
+  one of the four offered stakes so `_solo_start_guard()` accepts it). The
+  `challenges_max_participants_range` CHECK was widened to allow up to 32
+  seats for `pooled` (and 2, not 3, at the bottom, because pre-`20260908`
+  bouts were backfilled to two seats whatever their format).
+- **Entering is playing.** `pooled_enter()` takes the competition row
+  `FOR UPDATE`, runs the shared guard (profile, offered stake, and the
+  `round_open` rule — a staked round you have not played blocks this too),
+  refuses a second seat (`pool_already_entered`) and a full house
+  (`pool_full`), locks the fighter's profile, debits the fee, inserts the
+  `match_participants` row and the `stake` ledger row, and stamps
+  `filled_at` on the last seat. The client pushes the camera with the
+  returned `match_id` straight away. There is no lobby, no heartbeat, and
+  no "everyone shows up at once": a fighter's round is played when they
+  enter, and their score waits on the board.
+- **It settles when the last score lands**, through the same
+  `settle_match()` everything else runs, inline in
+  `submit_verification_session()`. A pooled match with seats still open
+  returns `not_ready` instead of raising on the participant count, because
+  its count grows one entrant at a time.
+- **The prize table** is `_pool_prize_shares_bp()` = `{5000, 3000, 2000}`:
+  50 / 30 / 20 of the pot to first, second and third; everyone else gets
+  nothing. Ties share: fighters on the same score occupy consecutive
+  places and split the sum of those places' prizes evenly, remainder to
+  the lowest `user_id` — the old remainder rule, applied per place group.
+  Any truncation residue goes to the top group so the ledger stays
+  zero-sum (asserted). With every stake a multiple of 50 the residue is
+  always zero in practice.
+- **It is casual** (`is_ranked = false`): a shared match cannot be
+  half-rated, and the ranked/casual switch is per attempt. **Trophies still
+  move, for the top score only**: `_rank_apply_match()` receives the
+  first-place group exactly as it always has, so second and third are paid
+  but recorded as losses on the trophy ladder. That is the existing rule
+  ("only the best score wins") applied to a bigger field, it is a product
+  decision, and it is the one most worth revisiting: a fighter who places
+  second of six three times running loses eighteen trophies for it. Giving
+  places a `tie`-style award would be one extra argument to
+  `_rank_apply_match()`.
+- `pooled_competitions` is readable by any signed-in fighter (the title,
+  the pot and the seat count *are* the card; there is nothing private on
+  the row) and writable by nobody; the seat count and the caller's own
+  status come from the composite `pooled_featured_row`, not from the table.
+- `challenges.created_by` on a competition is whoever looked first: the
+  column is `NOT NULL` with an FK to `auth.users`, and a competition has no
+  other author.
+
+**Known limitations, deliberately not solved here:**
+
+- **An entrant who never plays their round strands the pot.** No forfeit
+  rule exists anywhere in this schema (see "No forfeit rule" under Live
+  matchmaking), and this is the mode where it bites hardest: one abandoned
+  entry in a full competition holds five other stakes forever, though the
+  card itself has already moved on to the next competition.
+- **No time-box.** A competition lives until it fills. On the pilot's user
+  base a six-seat competition may sit for a long time, and the entrants'
+  fees sit in it. The spec's example title ("Pooled Push-Ups, Daily")
+  implies a daily rollover; none is built, and the titles say "Pooled
+  Push-ups" rather than claim one. Six seats is one function
+  (`_pool_max_entries()`) precisely so it can be dropped for the pilot.
+- **Joining blocks `delete_my_account()`** until the competition settles,
+  the way any unsettled bout does (`live_bouts`).
+- **The open-round guard measures from the match's `created_at`**, which
+  for a competition is when it *opened*, not when the fighter entered. An
+  entrant of a two-day-old competition who abandons the camera is not
+  blocked from other modes the way an abandoned 1v1 round would block them.
+
+### Blitz: one threshold and a curve, not three tiers
+
+Blitz had three calibrated bars paying 1.5x / 2x / 2.5x. `blitz_runs` now
+carries two bars and the two ends of a curve, all snapshotted at start:
+
+```
+threshold_score   the score at the fighter's OWN rating (offset 0)
+benchmark_score   the score at rating + _solo_blitz_benchmark_offset() (+320,
+                  the old top tier's offset); forced at least one step above
+                  the threshold in raw units, as adjacent tiers were
+breakeven_bp      10000   (_blitz_breakeven_bp)
+max_bp            25000   (_blitz_max_bp)
+```
+
+and `_blitz_multiplier_bp(score, threshold, benchmark)` pays, in basis
+points of the stake:
+
+```
+score <  threshold            ->  0             stake lost
+score =  threshold            ->  10000         break even: stake returned, net 0
+threshold < score < benchmark ->  10000 + 15000 * (score - threshold) / (benchmark - threshold)
+                                                truncated, never rounded up
+score >= benchmark            ->  25000         the 2.5x cap
+```
+
+**Linear from break-even at the threshold to 2.5x at the benchmark, capped
+there.** That is the documented scaling curve the spec asked for; it is one
+SQL function and one mirrored TypeScript function
+(`blitzMultiplierBp()` in `src/lib/score.ts`, asserted equal point for
+point in `score.db.test.ts`), so a smooth curve or a different benchmark
+offset is a one-function change on each side. Clearing the threshold is the
+win for rating purposes — one Elo update against a virtual opponent at
+`threshold_rating`, exactly as tier 1 was — and the margin above it moves
+only the payout, so Blitz still does not weight margin of victory anywhere
+the rest of the rating system does not.
+
+**Expected value**, on the same Elo model the old tiers were graded on
+(P(clear) at rating offsets 0 / +150 / +320 = 0.500 / 0.297 / 0.137, the
+curve taken as linear in rating space between them):
+
+```
+below threshold           p = 0.500   pays 0
+threshold .. +150         p = 0.203   ~1.0x .. ~1.7x, mean ~1.35x
++150 .. +320              p = 0.160   ~1.7x .. 2.5x,  mean ~2.1x
+at or past the benchmark  p = 0.137   2.5x
+EV per stake  ≈ 0.203·1.35 + 0.160·2.10 + 0.137·2.5  ≈ 0.95
+```
+
+Just under parity, as the tiers were (~0.97), for the same reason: a solo
+wager that paid at or above parity would inflate the points economy with
+no second stake feeding the pot.
+
+⚠️ **Two places the reference image does not map onto Fittr's numbers,
+flagged rather than forced:**
+
+1. **The curve's shape.** The reference sweeps a smooth convex curve from
+   the bottom-left up through "Break Even" to 2.5x. Fittr's payout is zero
+   below the threshold, jumps to 1.0x at it, and is linear to 2.5x. The
+   graph (`src/components/PayoutCurve.tsx`, plain Views, no SVG dependency)
+   draws exactly that: a muted line at zero payout climbing the score axis
+   to the threshold, a dotted jump across to break-even at that score, the
+   accent line to 2.5x at the benchmark, and a flat cap beyond it. It
+   samples `blitzMultiplierBp()` point by point, so it draws whatever the
+   function says if the function changes. The reference's checkpoints
+   ("Break Even", "2x", "2.5x") are placed at the scores the real function
+   reaches them, with ticks on the right axis in score units.
+2. **The EV is a model of a model.** The curve is linear in *score*, and
+   score-vs-rating is not linear — the norms curve is logistic in rating
+   and piecewise-linear in raw terms, and the whole thing sits on the 85%
+   reference quality above. The true house edge depends on where on that
+   curve a fighter sits and on how real form quality clusters. Once real
+   Blitz sessions exist, the two numbers to look at are the realised mean
+   multiplier per stake and the realised P(clear); if the edge drifts,
+   `_solo_blitz_benchmark_offset()` (a higher offset makes 2.5x rarer)
+   and `_score_reference_quality_bp()` are the levers.
+
+`blitz_preview_row` was dropped and recreated (a composite type cannot lose
+attributes in place); `streak_preview_row` gained `reference_quality_bp`
+with `ALTER TYPE ... ADD ATTRIBUTE`, which every function returning it
+picks up on its next call. `_solo_blitz_tier_offsets()`,
+`_solo_blitz_tier_bp()` and `_blitz_ladder()` are dropped.
+
+### Streak: unchanged mechanics, score-unit stages, "revive" on screen
+
+Nothing about the run changed: three stages at offsets −200 / −100 / 0,
+staked once, 4x on clearing all three, failing ends the run at that stage,
+`streak_buy_back_in()` retries the SAME stage for another stake inside five
+hours of `failed_at`, past which the next `streak_start()` is a new run at
+stage 1, and a win locks the mode for five hours. Both timers, the
+re-anchoring on a second failure, the one-active-run and one-open-attempt
+indexes, and the per-attempt Elo update are exactly as `20260916000100`
+describes them. Two things did change:
+
+- Stage targets are scores (above), and `_solo_settle()` compares
+  `mp.score` to the stage's target.
+- The screens call the buy-back **"Revive"**, matching the reference's
+  failure state; the RPC keeps its name. The failure-state badge shows the
+  run's payout multiplier (4x) — "what the run would have paid" — because
+  nothing is paid for a partial run and there is no per-stage cash-out;
+  showing a per-stage number would have implied one.
+
+### Navigation and screens
+
+The four-tab bar became three: **Compete / Rank / Profile**. `Home`
+("Bouts") and `FindBout` are gone as routes, as are `BlitzPre` and
+`StreakPre`; nothing in the app navigates to any of them. `Searching`
+(the live 1v1 queue wait state), `MatchInProgress`, `Results` and
+`StreakRun` keep their routes and their `gestureEnabled: false` reasoning.
+
+| Route | File | What it is |
+| --- | --- | --- |
+| `Compete` | `src/screens/CompeteScreen.tsx` | The featured pooled card (title, pot so far and at full, entry fee, description, seats filled, the caller's status), the fighter's own open rounds ("In the ring", carried over from Bouts because an unplayed round blocks every other mode and must stay one tap away), and the exercise grid. |
+| `ExerciseModes` | `src/screens/ExerciseModesScreen.tsx` + `src/screens/modes/*` | One exercise, pill tabs **1v1 / Blitz / Streak** over a horizontal pager kept in step both ways. Takes `mode` (which tab to open on) and `fresh` (offer a new Streak run even inside a failed run's revive window). |
+| `Pooled` | `src/screens/PooledScreen.tsx` | The featured competition in full: pot, fee, seats, the prize table on a full pot, and ENTER — which pays and opens the camera at once. |
+| `StreakRun` | `src/screens/StreakRunScreen.tsx` | Rewritten around the reference's stage list and failure state; keeps its three states and the lime win flood. |
+
+The three panes share `src/screens/modes/PaneShared.tsx`: the **WIN**
+display (label, rule, the payout for the stake on the stepper, updating
+live), the **stake dock** (minus / value / plus stepping through
+`STAKE_OPTIONS` and skipping anything the balance cannot cover, beside a
+single PLAY), and the open-round block. Each pane owns its own reads, its
+own `RankedToggle` (casual on every mount; the screen is pushed fresh each
+time, so nothing carries over), and its own dock:
+
+- **1v1** — WIN = both stakes; PLAY enters `Searching` with the request.
+- **Blitz** — MAX PAYOUT (stake × 2.5x) and BREAK EVEN (the threshold, with
+  "≈ N reps at 85% form"), the payout curve, the switch; PLAY calls
+  `blitz_start()` and `replace`s into the camera.
+- **Streak** — the WIN display, three stage cards (`StreakStages`: number,
+  SCORE TO BEAT, "≈ N reps" caption; the active stage bordered in the
+  accent, cleared ones checked, locked ones faded with a lock, a failed one
+  with a filled X badge in the recording red — the one non-lime colour the
+  system already had), and the six states in the file header comment. The
+  failure state has the reference's two actions: NEW STREAK (secondary:
+  reveals the stake control for a fresh run at stage 1, allowed even
+  inside the window) and REVIVE (primary: `streak_buy_back_in()`).
+
+`MatchInProgressScreen` feeds the `FormQualityMeter`, shows a **SCORE ·
+FORM** line under the live counter (updated when the count or the held
+second changes, never per frame), replaces the Blitz tier pips with a
+break-even-to-cap bar and the live multiplier once the bar is cleared,
+shows a Streak stage's score to beat, and submits `p_form_quality_bp`.
+The "in the books" screen leads with the score, with the raw count and
+form under it.
+
+`ResultsScreen`'s tape shows each seat's score with "34 reps · 88% form"
+under it, and on a pooled bout each row's place and prize once settled. A
+paid second or third gets its own state ("IN THE MONEY") with the net
+shown; a Blitz result is drawn on the same `PayoutCurve` with the score
+marked on it.
+
+`src/lib/boutStats.ts` gained a `placed` outcome (counted as a loss in the
+W/L record so the record agrees with the profile row, and shown as its
+place number in Profile's recent rows), `myRaw` / `myPlace` on every
+bout, and a best-score-per-exercise beside the raw personal best.
+
+### What the tests cover
+
+- `__tests__/score.test.ts` — the arithmetic and its rounding, the
+  reference conversion in both directions, the curve at every corner
+  (below, on, between, at and past the bars; the truncation; the inverse
+  used for the graph labels), and the meter's two modes (peaks per counted
+  rep, an unfinished rep excluded; in-position frames only for a hold).
+- `__tests__/score.db.test.ts` — against the embedded Postgres with every
+  migration replayed: the client constants equal the SQL tunables;
+  `_score_for()` and `_blitz_multiplier_bp()` agree with the mirrors point
+  for point; `submit_verification_session()` writes quality and score to
+  both tables, scores a missing reading at the reference, and rejects an
+  out-of-range one; a 1v1 is decided on score against the raw count, a
+  dead heat on score refunds, and the rating agrees with the money; Blitz
+  pays 0 / 1.0x / 2.5x at the three corners and the curve between them,
+  and rates the bar not the margin; a Streak stage is judged on score; the
+  pooled competition opens on first look, is the same for everyone until
+  it fills, charges and seats on entry, refuses a second seat and a
+  fighter with an open round, fills, hands the card to the next one before
+  the last score is in, settles on that score, pays 50 / 30 / 20 by
+  place with the ledger zero-sum, and is readable by all and writable by
+  none.
+- `__tests__/soloModes.db.test.ts` — rewritten for the curve where it
+  covered tiers; the Streak and ranked/casual sections unchanged apart
+  from submitting *at a score* rather than at a rep count.
+- `__tests__/matchmaking.db.test.ts` — the queue-formed group settlement
+  tests now expect 50 / 30 / 20 by place (a three-seat 100-point bout
+  pays 150 / 90 / 60; a tie for first shares places 1 and 2).
+- `__tests__/boutStats.test.ts` — the score-based derivation, the `placed`
+  outcome from a place, and the ledger fallback for rows without one.
+- `__tests__/compete.screen.test.tsx` — the Compete screen and the mode
+  screen mounted with Supabase faked: the featured card renders what
+  `pooled_featured()` returned and leads to the Pooled screen, a tile leads
+  to its exercise's mode screen, the three panes mount with their
+  previews, the 1v1 WIN display follows the stake stepper, PLAY enters the
+  queue with the pane's request, and PLAY on Blitz calls `blitz_start()`
+  and `replace`s into the camera.
+- The `skillRating`, `performanceNorms` and `rank` suites pass unchanged.
+  The whole suite is 17 files / 361 tests, all green on 2026-09-19.
+
+### ⚠️ What is NOT verified
+
+- **Real form quality.** The 85% reference is unmeasured, and so is every
+  threshold that depends on it. The first real sessions on a phone should
+  be read for `raw_metrics.form.qualityBp` before anyone trusts a bar.
+- **Wall-sit form quality in particular** rides the `fitness.squats` proxy
+  (see "Exercise types and the wall-sit proxy"): a static hold may score a
+  systematically different probability from an active squat, which would
+  make wall-sit's reference quality wrong even once push-ups' is right.
+- **The Blitz EV** is modelled, not observed — see the two flags above.
+- **Nothing has run through PostgREST**, and no EAS build carries any of
+  this. `pooled_featured_row` and the new `blitz_preview_row` are composite
+  returns whose JSON shape is asserted from the migration, not observed on
+  the wire, exactly as `leaderboard_row` was. The `ALTER TYPE ... ADD
+  ATTRIBUTE` on `streak_preview_row` is the one shape here worth eyeballing
+  on first run: `reference_quality_bp` should arrive as a top-level key.
+- **The pager.** `ExerciseModesScreen` syncs pill tabs and a paging
+  `ScrollView` by measured width and height; it typechecks and mounts
+  under Jest but has not been swiped on a device.
+- **The curve component** draws with rotated Views; it renders under Jest
+  but its pill placement at narrow widths has not been seen on a phone.
+
+### Deploy status
+
+**Not deployed.** `20260919000000_score_based_settlement` is in the repo
+and replays cleanly on the embedded Postgres; it has not been applied to
+the live project, and no EAS build carries the client. Because the client
+now sends a sixth argument to `submit_verification_session()` that the
+live function does not have, and reads `blitz_runs` columns that do not
+exist yet, **the migration and the build must ship together**, the usual
+loop: commit → push → `npm run db:deploy` → `eas build` → install. The
+iOS build quota on the Free plan is exhausted until 2026-10-01.

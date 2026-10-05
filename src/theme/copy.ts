@@ -10,6 +10,7 @@ import type {
   StrengthTier,
 } from '../types/database';
 import type { IconName } from './icons';
+import type { CompeteMode } from '../navigation/types';
 
 /**
  * Display copy for enum values. Copy only: the underlying values are the
@@ -47,6 +48,52 @@ export const EXERCISE_ICON: Record<ChallengeType, IconName> = {
   race: 'run',
 };
 
+/** One line under each exercise tile on Compete. */
+export const EXERCISE_DESC: Record<ChallengeType, string> = {
+  pushups: 'Max set. Scored on reps and form.',
+  plank: 'Max hold. Scored on time and form.',
+  wallsit: 'Max hold at 90°. Scored on time and form.',
+  race: 'Watch-verified pace. Coming later.',
+};
+
+// ── Compete modes ───────────────────────────────────────────────────────
+
+/** The three tabs on an exercise's mode screen, in order. */
+export const COMPETE_MODES: readonly CompeteMode[] = ['1v1', 'blitz', 'streak'];
+
+export const MODE_LABEL: Record<CompeteMode, string> = {
+  '1v1': '1v1',
+  blitz: 'Blitz',
+  streak: 'Streak',
+};
+
+export const MODE_ICON: Record<CompeteMode, IconName> = {
+  '1v1': 'crosshair',
+  blitz: 'bolt',
+  streak: 'flag',
+};
+
+export const MODE_NOTE: Record<CompeteMode, string> = {
+  '1v1': 'Head-to-head, matched live with a fighter at your level. Higher score takes both stakes.',
+  blitz:
+    'Solo. One set against a score set to your rank. Clear it to break even; every point past it pays more, up to 2.5x.',
+  streak:
+    'Solo. Three stages, one stake. Clear all three in a row for the payout. Miss one and you have five hours to revive at the same stage.',
+};
+
+/**
+ * How a score is made. Shown once per mode screen so the number on every
+ * card is never a mystery.
+ */
+export const SCORE_RULE =
+  'Score = valid reps (or seconds held) × form quality. Only reps that clear the form bar count, and cleaner form is worth more per rep.';
+
+/** The featured pooled competition, in one line under the card title. */
+export const POOLED_KICKER = 'FEATURED · POOLED';
+
+export const POOLED_RULE =
+  'Enter, play your round on the spot, and your score sits on the board until the last seat fills. Top three split the pot 50 / 30 / 20.';
+
 /**
  * Camera verification exists for these three. Race needs a watch and a
  * settlement rule that doesn't exist yet (settle_match raises on it), so it
@@ -66,28 +113,28 @@ export const FORMAT_LABEL: Record<ChallengeFormat, string> = {
 };
 
 export const FORMAT_NOTE: Record<ChallengeFormat, string> = {
-  '1v1': 'Head-to-head. Matched live with a fighter at your level. Winner takes both stakes.',
+  '1v1': 'Head-to-head. Matched live with a fighter at your level. Higher score takes both stakes.',
   pooled:
-    'Group Battle. The lobby fills live, the bout opens for everyone at once, top finisher takes the pot.',
+    'Pooled. Every entrant plays one round; when the last seat fills the field is ranked by score and the top three split the pot 50 / 30 / 20.',
   blitz:
-    'Solo. One set against three bars set to your level. Clear the highest one you can and take the multiplier.',
+    'Solo. One set against a score set to your rank. Break even at the bar, up to 2.5x past it.',
   streak:
-    'Solo. Three stages, one stake. Clear all three in a row for the payout — miss one and you have five hours to buy back in.',
+    'Solo. Three stages, one stake. Clear all three in a row for the payout — miss one and you have five hours to revive.',
 };
 
 /** What the format is called on a card. */
 export const FORMAT_NAME: Record<ChallengeFormat, string> = {
   '1v1': '1v1',
-  pooled: 'Group Battle',
+  pooled: 'Pooled',
   blitz: 'Blitz',
   streak: 'Streak',
 };
 
 /**
- * The two solo formats, in the order Find a Bout offers them. Neither takes
- * a player count or an opponent, and both are set up on their own pre-bout
- * screen rather than on Find a Bout, because a stake is only half of what
- * they need — the other half is seeing the bar before agreeing to it.
+ * The two solo formats. Neither takes a player count or an opponent, and
+ * both are set up on the exercise's mode screen, because a stake is only
+ * half of what they need — the other half is seeing the bar before agreeing
+ * to it.
  */
 export const SOLO_FORMATS: readonly ChallengeFormat[] = ['blitz', 'streak'];
 
@@ -131,10 +178,10 @@ export const SOLO_CALIBRATION_ROUGH =
   'These targets are a population average. Add your age band and gender in Settings to have them set to you.';
 
 export const BLITZ_RULES =
-  'One set. The highest bar you clear pays its multiplier on your stake. Miss the first one and the stake is gone.';
+  'One set. Match the score to break even, beat it to earn more — up to 2.5x your stake at the top of the curve. Fall short and the stake is gone.';
 
 export const STREAK_RULES =
-  'Stake once. Clear all three stages in a row to take the payout. Miss one and the run ends there — with five hours to buy back in at the same stage.';
+  'Stake once. Clear all three stages in a row to take the payout. Miss one and the run ends there — with five hours to revive at the same stage.';
 
 /**
  * Group Battle sizes offered by Find a Bout. The database allows 2..6 on

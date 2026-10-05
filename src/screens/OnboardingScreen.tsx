@@ -58,7 +58,7 @@ export function OnboardingScreen({ navigation }: Props) {
     if (session) {
       await markOnboarded(session.user.id);
     }
-    navigation.replace('Home');
+    navigation.replace('Compete');
   };
 
   const requestCamera = async () => {

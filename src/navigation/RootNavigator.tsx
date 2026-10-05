@@ -8,11 +8,10 @@ import { Loading } from '../theme/ui';
 import type { RootStackParamList } from './types';
 import { LoginScreen } from '../screens/LoginScreen';
 import { OnboardingScreen } from '../screens/OnboardingScreen';
-import { HomeScreen } from '../screens/HomeScreen';
-import { FindBoutScreen } from '../screens/FindBoutScreen';
+import { CompeteScreen } from '../screens/CompeteScreen';
+import { ExerciseModesScreen } from '../screens/ExerciseModesScreen';
+import { PooledScreen } from '../screens/PooledScreen';
 import { SearchingScreen } from '../screens/SearchingScreen';
-import { BlitzPreScreen } from '../screens/BlitzPreScreen';
-import { StreakPreScreen } from '../screens/StreakPreScreen';
 import { StreakRunScreen } from '../screens/StreakRunScreen';
 import { MatchInProgressScreen } from '../screens/MatchInProgressScreen';
 import { ResultsScreen } from '../screens/ResultsScreen';
@@ -31,8 +30,8 @@ import { TransactionsScreen } from '../screens/settings/TransactionsScreen';
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 /**
- * Bouts / Find / Rank / Profile are tabs drawn by each screen's own TabBar,
- * but they sit on this one native stack, so without this a tab tap played a
+ * Compete / Rank / Profile are tabs drawn by each screen's own TabBar, but
+ * they sit on this one native stack, so without this a tab tap played a
  * full push/pop slide with the tab bar riding along. A tab switch should
  * be instant, like a real tab bar, and the back-swipe should not reveal
  * the previous tab underneath. Searching, match and results screens keep
@@ -84,8 +83,8 @@ export function RootNavigator() {
   // Every screen draws its own chrome (back circles, page heads, the tab
   // bar) exactly where the design puts it, so the native header is off.
   // When the signed-in set replaces Login, React Navigation lands on the
-  // FIRST screen listed, which is why Onboarding is ordered ahead of Home
-  // for a first-time user.
+  // FIRST screen listed, which is why Onboarding is ordered ahead of
+  // Compete for a first-time user.
   const onboarding = (
     <Stack.Screen name="Onboarding" component={OnboardingScreen} />
   );
@@ -105,9 +104,16 @@ export function RootNavigator() {
         {signedIn ? (
           <>
             {onboarded ? null : onboarding}
-            <Stack.Screen name="Home" component={HomeScreen} options={TAB_SCREEN} />
+            <Stack.Screen name="Compete" component={CompeteScreen} options={TAB_SCREEN} />
             {onboarded ? onboarding : null}
-            <Stack.Screen name="FindBout" component={FindBoutScreen} options={TAB_SCREEN} />
+            {/*
+              The per-exercise mode screen and the pooled detail are ordinary
+              pushes with the default slide and back-swipe: nothing is staked
+              and nothing is running while they are open, so backing out of
+              either needs no interception at all.
+            */}
+            <Stack.Screen name="ExerciseModes" component={ExerciseModesScreen} />
+            <Stack.Screen name="Pooled" component={PooledScreen} />
             {/*
               No back-swipe: leaving the queue has to go through the screen's
               own cancel path (it must learn whether the lobby filled in the
@@ -121,16 +127,8 @@ export function RootNavigator() {
               options={{ gestureEnabled: false }}
             />
             {/*
-              The two solo set-up screens. Ordinary pushes with the default
-              slide and the default back-swipe: unlike Searching, nothing is
-              staked and nothing is running while they are open, so backing
-              out of one needs no interception at all.
-            */}
-            <Stack.Screen name="BlitzPre" component={BlitzPreScreen} />
-            <Stack.Screen name="StreakPre" component={StreakPreScreen} />
-            {/*
               No back-swipe: this screen is reached by `replace` from the
-              camera with a stake already spent, and its states (buy back in,
+              camera with a stake already spent, and its states (revive,
               start the next stage) are the only sensible ways forward. A
               gesture back to a set-up screen would offer to stake again.
             */}

@@ -217,7 +217,7 @@ export function RankScreen({ navigation }: Props) {
           events={history}
           loading={historyLoading && history.length === 0}
           session={session}
-          onFindBout={() => navigation.navigate('FindBout')}
+          onFindBout={() => navigation.navigate('Compete')}
         />
       </ScrollView>
 

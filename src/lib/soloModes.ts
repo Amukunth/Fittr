@@ -1,5 +1,4 @@
 import { supabase } from './supabase';
-import { formatSeconds } from './format';
 import type {
   BlitzPreviewRow,
   BlitzRunRow,
@@ -12,31 +11,22 @@ import type {
  * The client half of Blitz and Streak, and of the ranked/casual switch.
  *
  * Every mutation is one of five SECURITY DEFINER functions (see the
- * 20260916000100 migration and BACKEND.md); nothing here writes a table, and
- * nothing here decides a threshold, a multiplier or a payout -- the server
- * owns all three, and the run row carries the snapshot it was judged
- * against. What this file does own is display: turning basis points into
- * "2.5x", a target into "25 reps" or "1:45", and a deadline into a
- * countdown.
+ * 20260916000100 and 20260919000000 migrations and BACKEND.md); nothing
+ * here writes a table, and nothing here decides a threshold, a multiplier
+ * or a payout -- the server owns all three, and the run row carries the
+ * snapshot it was judged against. What this file does own is display:
+ * turning basis points into "2.5x", and a deadline into a countdown.
  *
- * The constants mirror the tunables declared at the top of that migration.
- * If one side changes, change the other -- the same arrangement as
- * HEARTBEAT_MS in matchmaking.ts and K_SETTLED in skillRating.ts, and
- * asserted against the database by __tests__/soloModes.db.test.ts so the two
- * cannot drift quietly.
+ * The score arithmetic and the Blitz curve live in src/lib/score.ts.
+ *
+ * The constants mirror the tunables declared at the top of those
+ * migrations. If one side changes, change the other -- the same
+ * arrangement as HEARTBEAT_MS in matchmaking.ts and K_SETTLED in
+ * skillRating.ts, and asserted against the database by
+ * __tests__/soloModes.db.test.ts so the two cannot drift quietly.
  */
 
 // ── Tunables, mirrored from SQL ─────────────────────────────────────────
-
-/**
- * Rating offsets for the three Blitz tiers, ascending. Tier 1 is the
- * fighter's own rating: by the Elo definition of a rating, the bar they are
- * a coin flip to clear.
- */
-export const BLITZ_TIER_OFFSETS: readonly number[] = [0, 150, 320];
-
-/** What each tier pays, in basis points of the stake. 25000 = 2.5x. */
-export const BLITZ_TIER_BP: readonly number[] = [15000, 20000, 25000];
 
 /**
  * Rating offsets for the three Streak stages, ascending. Stage 3's offset is
@@ -70,7 +60,14 @@ export type SoloResult<T> =
   | { data: T; error: null }
   | { data: null; error: string };
 
-async function rpc<T>(
+/**
+ * One RPC returning one composite row. Shared with src/lib/pooled.ts.
+ * PostgREST returns a function declared to return a composite type as one
+ * JSON object; kept defensive against the SETOF shape (an array) so a later
+ * signature change cannot silently break a screen, exactly as
+ * matchmaking.ts's firstRow() is.
+ */
+export async function rpc<T>(
   fn: string,
   args: Record<string, unknown>,
 ): Promise<SoloResult<T>> {
@@ -78,10 +75,6 @@ async function rpc<T>(
   if (error) {
     return { data: null, error: error.message };
   }
-  // PostgREST returns a function declared to return a composite type as one
-  // JSON object; kept defensive against the SETOF shape (an array) so a
-  // later signature change cannot silently break a screen, exactly as
-  // matchmaking.ts's firstRow() is.
   const row = Array.isArray(data) ? (data[0] as T | undefined) ?? null : (data as T | null);
   if (row === null || row === undefined) {
     return { data: null, error: `${fn} returned no row` };
@@ -89,7 +82,7 @@ async function rpc<T>(
   return { data: row, error: null };
 }
 
-/** The Blitz ladder for an exercise. Reads only; stakes nothing. */
+/** The Blitz bars for an exercise. Reads only; stakes nothing. */
 export function blitzPreview(
   exerciseType: ChallengeType,
 ): Promise<SoloResult<BlitzPreviewRow>> {
@@ -188,7 +181,7 @@ export async function streakRunIdForMatch(
  */
 export function soloErrorCopy(error: string): string {
   if (error.includes('round_open')) {
-    return 'You still have a round to fight. Finish it from In the ring first.';
+    return 'You still have a round to fight. Finish it from Compete first.';
   }
   if (error.includes('insufficient_points')) {
     return "You don't have that stake. Pick a smaller one.";
@@ -200,10 +193,10 @@ export function soloErrorCopy(error: string): string {
     return 'Streak is cooling down after your win. Come back when the clock runs out.';
   }
   if (error.includes('streak_buyback_expired')) {
-    return 'That buy-back window has closed. The next run starts at stage 1.';
+    return 'That revive window has closed. The next run starts at stage 1.';
   }
   if (error.includes('streak_run_not_failed')) {
-    return "That run isn't waiting on a buy-back.";
+    return "That run isn't waiting on a revive.";
   }
   if (error.includes('streak_run_not_active')) {
     return 'That run is over.';
@@ -229,13 +222,16 @@ export function soloErrorCopy(error: string): string {
 // ── Display ─────────────────────────────────────────────────────────────
 
 /**
- * 25000 -> "2.5x", 20000 -> "2x". Trailing ".0" is dropped so the common
- * multipliers read as whole numbers, which is how the design prints them.
+ * 25000 -> "2.5x", 20000 -> "2x", 11333 -> "1.13x". Two decimals only when
+ * the curve lands between whole tenths, so the common multipliers read as
+ * the design prints them.
  */
 export function fmtMultiplier(basisPoints: number): string {
   const times = basisPoints / 10000;
-  const one = times.toFixed(1);
-  return `${one.endsWith('.0') ? one.slice(0, -2) : one}x`;
+  const two = times.toFixed(2);
+  const trimmed = two.endsWith('0') ? two.slice(0, -1) : two;
+  const cleaned = trimmed.endsWith('.0') ? trimmed.slice(0, -2) : trimmed;
+  return `${cleaned}x`;
 }
 
 /** What a payout of `bp` on `stake` comes to. Mirrors the SQL truncation. */
@@ -243,83 +239,13 @@ export function payoutFor(stake: number, basisPoints: number): number {
   return Math.floor((stake * basisPoints) / 10000);
 }
 
-/**
- * A target in the exercise's own units: "25" reps, "1:45" for a hold. Same
- * split formatScore() makes, but for a threshold rather than a result -- and
- * without the "—" case, because a threshold is never absent.
- */
-export function fmtTarget(target: number, type: ChallengeType): string {
-  return type === 'pushups' ? String(target) : formatSeconds(target);
-}
-
-/** "REPS" / "SEC" for the unit beside a target. */
-export function targetUnit(type: ChallengeType): string {
-  return type === 'pushups' ? 'REPS' : 'HOLD';
-}
-
 // ── Pure logic (unit-tested in __tests__/soloModes.test.ts) ─────────────
 
-/** One rung of a Blitz ladder, in the order they are shown and cleared. */
-export interface BlitzTier {
-  /** 1-based, matching blitz_runs' column names and tier_reached. */
-  tier: number;
-  target: number;
-  /** Basis points of the stake. */
-  bp: number;
-  /** The virtual opponent's rating for this rung. */
-  rating: number;
-}
-
-/** The three rungs of a preview or a run, as a list. */
-export function blitzTiersOf(
-  row: Pick<
-    BlitzPreviewRow,
-    | 'tier1_target'
-    | 'tier2_target'
-    | 'tier3_target'
-    | 'tier1_bp'
-    | 'tier2_bp'
-    | 'tier3_bp'
-    | 'tier1_rating'
-    | 'tier2_rating'
-    | 'tier3_rating'
-  >,
-): BlitzTier[] {
-  return [
-    { tier: 1, target: row.tier1_target, bp: row.tier1_bp, rating: row.tier1_rating },
-    { tier: 2, target: row.tier2_target, bp: row.tier2_bp, rating: row.tier2_rating },
-    { tier: 3, target: row.tier3_target, bp: row.tier3_bp, rating: row.tier3_rating },
-  ];
-}
-
-/**
- * Which tier a score has reached: 0 for "not even the first bar". Mirrors
- * _solo_settle()'s CASE exactly, and is what the live counter on the camera
- * screen reads -- so the number on screen mid-set and the number settlement
- * writes come from the same rule stated twice, once per language.
- */
-export function tierReachedFor(score: number, tiers: readonly BlitzTier[]): number {
-  let reached = 0;
-  for (const t of tiers) {
-    if (score >= t.target) {
-      reached = t.tier;
-    }
-  }
-  return reached;
-}
-
-/** The next rung up, or null once the top one is cleared. */
-export function nextTierFor(
-  score: number,
-  tiers: readonly BlitzTier[],
-): BlitzTier | null {
-  return tiers.find(t => score < t.target) ?? null;
-}
-
-/** One stage of a Streak run, in order. */
+/** One stage of a Streak run, in order. Targets are SCORES. */
 export interface StreakStage {
   /** 1-based. */
   stage: number;
+  /** Score to beat. */
   target: number;
   rating: number;
 }
