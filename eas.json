@@ -5,17 +5,25 @@
   },
   "build": {
     "development": {
-      "developmentClient": true,
       "distribution": "internal",
-      "environment": "development"
+      "environment": "development",
+      "ios": {
+        "scheme": "FittrApp"
+      }
     },
     "preview": {
       "distribution": "internal",
-      "environment": "preview"
+      "environment": "preview",
+      "ios": {
+        "scheme": "FittrApp"
+      }
     },
     "production": {
       "autoIncrement": true,
-      "environment": "production"
+      "environment": "production",
+      "ios": {
+        "scheme": "FittrApp"
+      }
     }
   },
   "submit": {
